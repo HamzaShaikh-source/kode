@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>K.O.D.E. bridge spike</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 32 32%27%3E%3Crect width=%2732%27 height=%2732%27 fill=%27%2316130f%27/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/vendor/xterm/xterm.css">
+<link rel="stylesheet" href="/styles.css">
+<style>
+  body { padding: 20px; }
+  .wrap { max-width: 1200px; margin: 0 auto; display: grid; gap: 16px; }
+  .bar { display: flex; flex-wrap: wrap; gap: 12px 16px; align-items: flex-end; padding: 12px; }
+  .meters { flex: 1 1 360px; min-height: 38px; align-items: center; }
+  .stage { display: grid; grid-template-columns: 340px minmax(0, 1fr); gap: 20px; align-items: start; }
+  .tile { background: #0c0b09; border: 3px solid var(--ink); box-shadow: var(--shadow); padding: 6px; display: flex; flex-direction: column; }
+  .tile.mini { width: 340px; height: 230px; overflow: hidden; }
+  .tile.full { grid-column: 1 / -1; height: 520px; }
+  .term { flex: 1; min-height: 0; width: 100%; overflow: hidden; }
+  .head { cursor: zoom-in; flex: none; }
+  .tile.full .head { cursor: zoom-out; }
+  .meters { font-weight: 700; display: flex; gap: 18px; flex-wrap: wrap; }
+  .meters b { font-variant-numeric: tabular-nums; }
+  .head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; color: var(--paper); font-size: 11px; letter-spacing: .1em; text-transform: uppercase; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1 class="pg-title">Bridge spike</h1>
+  <p class="pg-deck">A real terminal session on this machine, streamed over a WebSocket into a browser tile. Click the tile header to enlarge or minimize it.</p>
+  <div class="card bar">
+    <div class="field"><label for="prov">Provider</label><select id="prov"></select></div>
+    <button type="button" class="btn btn-primary" id="start">Start session</button>
+    <button type="button" class="btn" id="stop" disabled>Stop</button>
+    <div class="meters" role="status" aria-live="off">
+      <span>state <b id="m-state">idle</b></span>
+      <span>keystroke round-trip (shell only, ms) last <b id="m-last">-</b> median <b id="m-med">-</b> p95 <b id="m-p95">-</b> n <b id="m-n">0</b></span>
+    </div>
+  </div>
+  <div class="stage">
+    <div class="tile mini" id="tile"><div class="head" id="head" title="Click the header to enlarge / minimize" role="button" tabindex="0"><span id="t-title">no session</span><span id="t-pid"></span></div><div class="term" id="term"></div></div>
+  </div>
+</div>
+<script src="/vendor/xterm/xterm.js"></script>
+<script src="/vendor/xterm/addon-fit.js"></script>
+<script>
+(() => {
+  const TOKEN = "__TOKEN__";
+  const $ = (s) => document.querySelector(s);
+  const state = { ws: null, term: null, fit: null, pending: [], rtts: [] };
+  const pct = (a, p) => { const s = [...a].sort((x, y) => x - y); return s.length ? s[Math.min(s.length - 1, Math.floor(p * s.length))] : null; };
+  const meters = () => {
+    const a = state.rtts;
+    $('#m-last').textContent = a.length ? a[a.length - 1].toFixed(0) : '-';
+    $('#m-med').textContent = a.length ? pct(a, 0.5).toFixed(0) : '-';
+    $('#m-p95').textContent = a.length ? pct(a, 0.95).toFixed(0) : '-';
+    $('#m-n').textContent = a.length;
+  };
+
+  async function loadProviders() {
+    const r = await fetch('/spike/providers?token=' + encodeURIComponent(TOKEN));
+    const list = await r.json();
+    $('#prov').innerHTML = list.map((p) => `<option value="${p.id}"${p.available ? '' : ' disabled'}>${p.label}${p.available ? '' : ' (not installed)'}</option>`).join('');
+  }
+
+  function start() {
+    stop();
+    const id = $('#prov').value;
+    const term = new Terminal({ fontFamily: 'JetBrains Mono, Consolas, monospace', fontSize: $('#tile').classList.contains('mini') ? 8 : 13, cursorBlink: true, theme: { background: '#0c0b09' }, scrollback: 2000 });
+    const fit = new FitAddon.FitAddon();
+    term.loadAddon(fit);
+    $('#term').innerHTML = '';
+    term.open($('#term'));
+    fit.fit();
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    const ws = new WebSocket(`${proto}://${location.host}/spike/ws?provider=${encodeURIComponent(id)}&token=${encodeURIComponent(TOKEN)}&cols=${term.cols}&rows=${term.rows}`);
+    Object.assign(state, { ws, term, fit, pending: [] });
+    $('#m-state').textContent = 'connecting';
+    ws.onopen = () => { $('#stop').disabled = false; };
+    ws.onmessage = (e) => {
+      const m = JSON.parse(e.data);
+      if (m.t === 'hello') { $('#m-state').textContent = 'live'; $('#t-title').textContent = m.label; $('#t-pid').textContent = 'pid ' + m.pid; }
+      else if (m.t === 'out') {
+        term.write(m.d);
+        if (state.pending.length) { state.rtts.push(performance.now() - state.pending.shift()); meters(); }
+      } else if (m.t === 'exit') $('#m-state').textContent = 'exited';
+      else if (m.t === 'error') { $('#m-state').textContent = 'error'; term.write('\r\n' + m.d + '\r\n'); }
+    };
+    ws.onclose = (e) => { if ($('#m-state').textContent !== 'exited') $('#m-state').textContent = e.code === 4403 ? 'denied' : e.code === 4404 ? 'unavailable' : 'closed'; $('#stop').disabled = true; };
+    term.onData((d) => { if (ws.readyState === 1) { if (id === 'shell') state.pending.push(performance.now()); ws.send(JSON.stringify({ t: 'in', d })); } });  // RTT only meaningful for echoing shells
+    term.onResize(({ cols, rows }) => { if (ws.readyState === 1) ws.send(JSON.stringify({ t: 'resize', cols, rows })); });
+  }
+  function stop() { if (state.ws) { try { state.ws.close(); } catch (_) {} } if (state.term) { state.term.dispose(); state.term = null; } }
+
+  $('#start').addEventListener('click', start);
+  $('#stop').addEventListener('click', () => { stop(); $('#m-state').textContent = 'stopped'; $('#stop').disabled = true; });
+  const toggleSize = () => {
+    const t = $('#tile'); t.classList.toggle('mini'); t.classList.toggle('full');
+    const mini = t.classList.contains('mini');
+    if (state.term) state.term.options.fontSize = mini ? 8 : 13;      // minimized tile = smaller type, same live session
+    setTimeout(() => { if (state.fit) state.fit.fit(); }, 50);
+  };
+  $('#head').addEventListener('click', toggleSize);
+  $('#head').addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleSize(); } });
+  window.addEventListener('resize', () => { if (state.fit) state.fit.fit(); });
+  window.__spike = { state, start, stop, meters };
+  loadProviders();
+})();
+</script>
+</body>
+</html>

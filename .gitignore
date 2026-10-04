@@ -1,0 +1,43 @@
+# secrets / local state - never committed
+.env
+*.env
+!.env.example
+*.db
+*.sqlite
+backend/scratch_run/
+backend/demo_output/
+backend/.pytest_cache/
+__pycache__/
+*.pyc
+node_modules/
+
+# generated evidence screenshots (regenerate with the verify scripts)
+shots/
+dist/
+
+backend/bridge_workdir/
+
+backend/.hub_key
+backend/.demo_nodes/
+backend/demo_workspaces/
+backend/hub.db
+
+backend/*.secret
+
+# tool output / local scratch that never belongs in the repo
+graphify-out/
+brag-output*/
+.token-optimizer/
+backend/Microsoft/
+browser-actions.md
+BLOCKERS.md
+research_notes/
+reports/
+.venv/
+venv/
+shots_extra.py
+shots_t4.py
+verify_interact.py
+verify_shots.py
+backend/bridge/provider_tiles_check.py
+backend/bridge/spike_browser_check.py

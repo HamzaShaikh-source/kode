@@ -1,0 +1,6 @@
+id: codex
+label: Codex
+command: [codex]
+command_win: [codex.cmd]   # on Windows a stale codex.exe can sit earlier on PATH than the npm shim; the shim is the maintained install
+tier: 0   # universal PTY adapter
+env_passthrough: []   # secret-like env vars are scrubbed unless listed here

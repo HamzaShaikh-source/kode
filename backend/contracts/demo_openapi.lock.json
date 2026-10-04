@@ -1,0 +1,8 @@
+{
+  "name": "demo",
+  "feature_id": "feat_8aa5f3f3b1",
+  "sha256": "98be7da3f7e14f068303e7f021b0e5a186ce2a51f962818a701be7c1fba1eeea",
+  "source": "baseline-on-disk",
+  "frozen_at": "2026-10-04T06:02:32.497254+00:00",
+  "algorithm": "sha256(openapi + 0x00 + ts)"
+}

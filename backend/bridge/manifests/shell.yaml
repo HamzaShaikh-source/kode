@@ -1,0 +1,6 @@
+id: shell
+label: Shell
+command: [bash]
+command_win: [cmd.exe]
+tier: 0   # universal PTY adapter: cmd.exe on Windows, bash elsewhere
+env_passthrough: []   # secret-like env vars are scrubbed unless listed here

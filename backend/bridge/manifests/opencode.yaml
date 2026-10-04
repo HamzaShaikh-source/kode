@@ -1,0 +1,5 @@
+id: opencode
+label: OpenCode
+command: [opencode]
+tier: 0   # universal PTY adapter
+env_passthrough: []   # secret-like env vars are scrubbed unless listed here

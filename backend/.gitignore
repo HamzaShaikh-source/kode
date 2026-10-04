@@ -1,0 +1,6 @@
+.env
+*.db
+__pycache__/
+.pytest_cache/
+scratch_run/
+demo_output/

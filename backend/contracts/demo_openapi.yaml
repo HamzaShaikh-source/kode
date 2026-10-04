@@ -1,0 +1,189 @@
+openapi: 3.0.3
+info:
+  title: Enterprise Billing API
+  version: 1.0.0
+  description: >
+    FROZEN INTERFACE CONTRACT for the demo feature "enterprise Stripe billing tier with
+    usage-based rate limits and frontend usage graphs". Backend, Frontend and QA agents
+    are all bound to this document. Do not edit after freeze; see demo_openapi.lock.json.
+paths:
+  /billing/tiers:
+    post:
+      operationId: createBillingTier
+      summary: Create an enterprise billing tier (mirrors a Stripe Price)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateBillingTierRequest'
+      responses:
+        '201':
+          description: Tier created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BillingTier'
+        '422':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /billing/usage:
+    get:
+      operationId: getBillingUsage
+      summary: Usage records for a customer in a billing period
+      parameters:
+        - name: customer_id
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: period
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [current, previous]
+            default: current
+      responses:
+        '200':
+          description: Usage report
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageReport'
+        '404':
+          description: Unknown customer
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /stripe/webhook:
+    post:
+      operationId: receiveStripeWebhook
+      summary: Stripe webhook receiver (signature verified server-side)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StripeWebhookEvent'
+      responses:
+        '200':
+          description: Event accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookAck'
+        '400':
+          description: Bad signature or payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+components:
+  schemas:
+    CreateBillingTierRequest:
+      type: object
+      required: [name, monthly_price_cents, rate_limit_per_minute, included_requests, overage_cents_per_1k]
+      properties:
+        name:
+          type: string
+        monthly_price_cents:
+          type: integer
+        rate_limit_per_minute:
+          type: integer
+        included_requests:
+          type: integer
+        overage_cents_per_1k:
+          type: integer
+    BillingTier:
+      type: object
+      required: [id, name, stripe_price_id, monthly_price_cents, rate_limit_per_minute, included_requests, overage_cents_per_1k, created_at]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        stripe_price_id:
+          type: string
+        monthly_price_cents:
+          type: integer
+        rate_limit_per_minute:
+          type: integer
+        included_requests:
+          type: integer
+        overage_cents_per_1k:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+    UsageRecord:
+      type: object
+      required: [id, customer_id, tier_id, metric, quantity, period_start, period_end, recorded_at]
+      properties:
+        id:
+          type: string
+        customer_id:
+          type: string
+        tier_id:
+          type: string
+        metric:
+          type: string
+          enum: [api_requests, seats, storage_gb]
+        quantity:
+          type: integer
+        period_start:
+          type: string
+          format: date-time
+        period_end:
+          type: string
+          format: date-time
+        recorded_at:
+          type: string
+          format: date-time
+    UsageReport:
+      type: object
+      required: [customer_id, tier, records, total_quantity, limit_exceeded]
+      properties:
+        customer_id:
+          type: string
+        tier:
+          $ref: '#/components/schemas/BillingTier'
+        records:
+          type: array
+          items:
+            $ref: '#/components/schemas/UsageRecord'
+        total_quantity:
+          type: integer
+        limit_exceeded:
+          type: boolean
+    StripeWebhookEvent:
+      type: object
+      required: [id, type, created, data]
+      properties:
+        id:
+          type: string
+        type:
+          type: string
+        created:
+          type: integer
+        data:
+          type: object
+          additionalProperties: true
+    WebhookAck:
+      type: object
+      required: [received]
+      properties:
+        received:
+          type: boolean
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+        detail:
+          type: string

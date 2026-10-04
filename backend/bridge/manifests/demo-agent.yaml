@@ -1,0 +1,5 @@
+id: demo-agent
+label: Scripted demo agent (no AI)
+command: ["{python}", "{backend}/bridge/demo_agent.py"]
+tier: 0   # follows a script embedded in .kode/TASK.md: lets the whole project flow be rehearsed offline
+env_passthrough: []

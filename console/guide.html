@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Guide | K.O.D.E.</title>
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23c15f3c'/%3E%3Ccircle cx='16' cy='16' r='5' fill='%23fff'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/console/assets/css/site.css">
+<script src="/console/assets/js/site.js"></script>
+</head>
+<body>
+<header class="sn"><div class="wrap">
+  <a class="brand" href="/"><i></i>K.O.D.E.</a>
+  <nav aria-label="Main"><a href="/">Overview</a><a class="btn primary" href="/console">Open the console</a></nav>
+</div></header>
+<div class="wrap doc">
+  <nav class="toc" aria-label="On this page"><a href="#start">Start the Brain</a><a href="#hackathon">At a hackathon</a><a href="#invite">Invite a teammate</a><a href="#join">Join as a teammate</a><a href="#project">Run a project</a><a href="#watch">Watch and control</a><a href="#models">Custom endpoints</a><a href="#orch">Orchestrator</a><a href="#usage">Usage and context</a><a href="#safety">Safety model</a><a href="#trouble">Troubleshooting</a></nav>
+  <article>
+    <h1>How to use K.O.D.E.</h1>
+    <p>The Brain is a small server you run. Teammates run a tiny agent that connects outward to it. You open the console in a browser.</p>
+
+    <h2 id="start">Start the Brain</h2>
+    <p>From the <code>backend</code> folder, with the hub enabled:</p>
+    <pre class="cmd">python -m uvicorn app:app --port 8000</pre>
+    <p>Open <b>http://localhost:8000/console</b>. On the Brain's own computer no key is needed. From another computer the console asks for the lead key, which is stored in <code>backend/.hub_key</code>. To let other machines connect over your network, bind the server to your LAN address and use that address in the invite.</p>
+
+    <h2 id="hackathon">At a hackathon</h2>
+    <p>One person (the lead) runs the Brain. Everyone else only needs Python, git, the GitHub CLI and their own coding agent.</p>
+    <ol>
+      <li><b>Same Wi-Fi:</b> start the Brain with <code>python run_kode.py --lan</code> (allow it through the firewall when Windows asks). Teammates use your PC's address, for example <code>http://192.168.1.20:8000</code>.</li>
+      <li><b>Different networks:</b> start a tunnel in front of port 8000, for example <code>cloudflared tunnel --url http://localhost:8000</code>, and start the Brain with <code>python run_kode.py --public-url https://your-name.trycloudflare.com</code>, or paste that address on the Settings page.</li>
+      <li>Invite each teammate from <b>Team</b>. Each one opens the link on their laptop and runs the single command it shows.</li>
+      <li>Create a project, pick a planner, choose <b>Turbo</b> permissions, approve the plan, and watch it build.</li>
+    </ol>
+    <p>The console asks for the lead key whenever it is opened from anywhere but the Brain's own PC, including through a tunnel. Invite links work once and expire (10 minutes to 24 hours, your choice).</p>
+
+    <h2 id="invite">Invite a teammate</h2>
+    <ol><li>Open <b>Team</b> and press <b>Invite teammate</b>.</li><li>Type their name, choose how long the link works and your access (<b>Full access</b> is the default for the lead), and check the address teammates use to reach this Brain.</li><li>Press <b>Create invite link</b> and send them the link. It works once.</li></ol>
+    <p>When their machine connects, the Team page lists it with what it is ready for: git installed, GitHub CLI logged in, and the identity its commits will use.</p>
+
+    <h2 id="join">Join as a teammate</h2>
+    <p>Open the link from your lead on your own laptop. The page shows one command for Windows (PowerShell) or macOS and Linux. It downloads a small agent from your lead's Brain into <code>kode-node</code> in your home folder, sets up a private Python environment, checks git, the GitHub CLI and your coding agents, and connects. You can read the script first with the button next to it.</p>
+    <p>Next time, run <code>start.ps1</code> (Windows) or <code>~/kode-node/start.sh</code>. Your member console link, with the kill switch, is printed when the agent connects. Projects are cloned into <code>kode-workspace</code> in your home folder, and commits use your own git identity and GitHub login.</p>
+
+    <h2 id="project">Run a project</h2>
+    <p>This is the main workflow. You need every teammate's laptop connected, with <code>git</code> and the GitHub CLI (<code>gh auth login</code>) set up, and an agent installed on each (Claude Code, Antigravity, OpenCode, Codex...).</p>
+    <ol><li>Open <b>Projects</b>, press <b>New project</b>, write the brief, pick each teammate's agent, choose the <b>Planner</b> (Claude Code or Codex using that laptop's own login, one of your API profiles, or the Brain default if one is configured), and press <b>Plan the project</b>. Nothing is chosen for you silently.</li>
+      <li>Review the plan: tasks, owners, the files each task may touch, the frozen contract and the verification command. Re-assign a task or ask for a re-plan.</li>
+      <li>Choose agent permissions: <b>Turbo</b> (agents never ask; fastest), <b>Supervised</b> (a supervisor model answers their questions) or <b>Ask me</b>. Then press <b>Approve and start building</b>. The coordinator laptop creates a private repository (or uses yours) and pushes the contract and team rules.</li>
+      <li>Each laptop clones the repository, creates a branch per task and starts its agent with the task file. The Projects page shows every task, its commits and a link to the live console.</li>
+      <li>Finished branches are checked by code: edits outside the task's files and any contract edit are reverted, then a pull request is opened from that laptop and merged.</li>
+      <li>When every task is merged, the verification command runs. If it fails, the model proposes fix tasks for the owners of the failing areas, up to three rounds.</li></ol>
+    <p>Commits come from each laptop's own git identity, merges keep individual commits (no squash), and the <b>Commit balance</b> panel is computed from git history. When an agent stops on a question (permission, file edit, trust folder), a supervisor model (the same one you chose as Planner) reads the screen and decides which keys to press. It never answers terms, logins, data-sharing or destructive prompts; those appear as cards for you, and fixed rules take over if the supervisor model is unavailable.</p>
+    <p>Honest limits: quality depends on the agents and models your team uses; the plan is only as good as the brief; a laptop that goes offline pauses its tasks until it returns.</p>
+
+    <h2 id="watch">Watch and control</h2>
+    <p>The <b>Brain</b> page shows a live console for every session. Click one to open the full terminal with its plan, changed files and usage.</p>
+    <table><thead><tr><th>Mode</th><th>What you can do</th></tr></thead><tbody>
+      <tr><td>Watch</td><td>Read only. The default.</td></tr><tr><td>Suggest</td><td>Place text in their prompt for them to send.</td></tr>
+      <tr><td>Co-pilot</td><td>Both of you can type. Expires automatically.</td></tr><tr><td>Takeover</td><td>Only you type. Ends after 10 minutes at most.</td></tr></tbody></table>
+    <p>Sessions that are waiting on a person show a <b>Needs you</b> chip and add to the count in the tab title.</p>
+
+    <h2 id="models">Custom endpoints</h2>
+    <p>On <b>Models</b>, press <b>New profile</b>: name, base URL, protocol, key, model list, and optionally prices and the context window. Use <b>Test connection</b> to check it.</p>
+    <p>When you start a session, pick the profile under <b>Model source</b>. Claude Code needs an Anthropic Messages endpoint, Codex needs the OpenAI Responses API, and OpenCode accepts OpenAI Chat or Responses. Hermes, Antigravity and shells cannot be redirected per session, and the dialog says why.</p>
+
+    <h2 id="orch">Orchestrator</h2>
+    <p>Describe a goal, for example: "Find out who is blocked and ask them for a status line." It reads the team, reads screens, and proposes actions. In <b>Ask</b> autonomy every write shows an approval card. It can only type where the owner has granted co-pilot or takeover, and each run is capped at 12 steps, 15 minutes and 150k tokens. The model it uses is chosen on the same page.</p>
+
+    <h2 id="usage">Usage and context</h2>
+    <p>Token counts and the context gauge are read from Claude Code and Codex transcripts. Other tools show <b>unknown</b>. Cost is an estimate: tokens times the per-million prices you set on a profile.</p>
+
+    <h2 id="safety">Safety model</h2>
+    <ul><li>Machines connect outward only. No inbound ports on teammates' laptops.</li><li>Control is enforced by the Brain and again by each teammate's agent.</li><li>Keys are encrypted at rest, injected into one session, and redacted from its output.</li><li>Pairing, starts, grants and the lead's input are written to an audit log.</li></ul>
+
+    <h2 id="trouble">Troubleshooting</h2>
+    <table><thead><tr><th>Symptom</th><th>Fix</th></tr></thead><tbody>
+      <tr><td>Console asks for a key</td><td>Open it on the Brain's computer, or paste the contents of <code>backend/.hub_key</code>.</td></tr>
+      <tr><td>Invite code rejected</td><td>Codes are single use and last 10 minutes. Create a new one.</td></tr>
+      <tr><td>Profile greyed out for a provider</td><td>The protocol does not match that agent. See the table on the Models page.</td></tr>
+      <tr><td>Context shows unknown</td><td>That tool does not expose it. Set a context window on the profile for custom endpoints.</td></tr>
+      <tr><td>Locked out after wrong keys</td><td>Eight failures in five minutes pause attempts from that address. Wait and retry.</td></tr></tbody></table>
+  </article>
+</div>
+</body>
+</html>

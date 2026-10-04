@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>K.O.D.E. · Agent Command Center</title>
+<meta name="description" content="K.O.D.E. — a single-page operations console for supervising a fleet of AI coding agents.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%2316130f'/%3E%3Crect x='6' y='6' width='20' height='20' fill='%23e8431f'/%3E%3C/svg%3E">
+<link rel="preload" href="fonts/JetBrainsMono-Regular.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="fonts/fraunces-latin-600-normal.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<div class="shell">
+  <aside class="rail">
+    <div class="brand">
+      <span class="brand-mark">K.O.D.E.</span>
+      <span class="brand-sub">Agent command center</span>
+    </div>
+    <nav id="nav" class="nav" aria-label="Primary"></nav>
+    <section class="roster" aria-labelledby="roster-h">
+      <h2 id="roster-h" class="roster-h">Fleet roster</h2>
+      <ul id="roster" class="roster-list"></ul>
+    </section>
+    <div class="rail-foot">
+      <button type="button" class="btn btn-rail" id="btn-reset-rail" data-act="reset-demo" data-fid="rail-reset">Reset demo data</button>
+    </div>
+  </aside>
+
+  <div class="main-col">
+    <header class="top">
+      <div class="top-id">
+        <span class="eyebrow">Project</span>
+        <strong id="hdr-project" class="top-project"></strong>
+      </div>
+      <div class="top-hud" aria-hidden="true">
+        <span class="hud-l">HB</span><span id="hb" class="hb"></span><span id="hb-t" class="hud-t"></span>
+      </div>
+      <div class="top-actions">
+        <span id="sim-pill" class="pill"></span>
+        <button type="button" id="btn-new" class="btn btn-primary" data-act="new-task">New task <kbd aria-hidden="true">N</kbd></button>
+      </div>
+    </header>
+    <div id="mode-ribbon" class="ribbon" role="note" hidden></div>
+    <main id="main" tabindex="-1"><div id="view"></div></main>
+  </div>
+</div>
+
+<dialog id="dlg" aria-labelledby="dlg-title"></dialog>
+<div id="live" class="toast" role="status" aria-live="polite" aria-atomic="true"></div>
+
+<script src="app.js"></script>
+</body>
+</html>

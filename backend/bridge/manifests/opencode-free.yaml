@@ -1,0 +1,5 @@
+id: opencode-free
+label: OpenCode (free model)
+command: [opencode, -m, opencode/big-pickle]
+tier: 0
+env_passthrough: []

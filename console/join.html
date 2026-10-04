@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Join your team | K.O.D.E.</title>
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23c15f3c'/%3E%3Ccircle cx='16' cy='16' r='5' fill='%23fff'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/console/assets/css/site.css">
+<script src="/console/assets/js/site.js"></script>
+<script type="module" src="/console/assets/js/join.js"></script>
+</head>
+<body>
+<header class="sn"><div class="wrap"><a class="brand" href="/"><i></i>K.O.D.E.</a></div></header>
+<main class="wrap join">
+  <section id="join-head">
+    <h1 id="join-title">Join your team</h1>
+    <p class="lead" id="join-sub">Checking your invite...</p>
+  </section>
+  <section id="join-body" hidden>
+    <ol class="jsteps">
+      <li><b>Have these ready</b>
+        <ul class="jreq">
+          <li>Python 3.10 or newer</li>
+          <li>git, and the GitHub CLI logged in (<code>gh auth login</code>)</li>
+          <li>at least one coding agent you are signed in to: Claude Code, Codex, Antigravity...</li>
+        </ul>
+      </li>
+      <li><b>Run one command</b> in a terminal on this laptop
+        <div class="tabs" role="tablist" aria-label="Your operating system">
+          <button type="button" role="tab" data-os="win" aria-selected="true">Windows</button>
+          <button type="button" role="tab" data-os="mac" aria-selected="false">macOS</button>
+          <button type="button" role="tab" data-os="linux" aria-selected="false">Linux</button>
+        </div>
+        <p class="jhint" id="cmd-hint">Open <b>PowerShell</b> and paste:</p>
+        <pre class="cmd" id="cmd"></pre>
+        <div class="jrow"><button class="btn primary" type="button" id="copy">Copy command</button> <a class="btn" id="view" target="_blank" rel="noopener">Read the script first</a></div>
+        <p class="jhint">It installs a small agent into <code>kode-node</code> in your home folder, checks your tools, and connects to your team. Keep the window open while you work.</p>
+      </li>
+      <li><b>Done</b> when this page says you are connected.</li>
+    </ol>
+    <div class="note" id="status" role="status" aria-live="polite">Waiting for your laptop to connect...</div>
+    <details class="jmore"><summary>What does this give the lead?</summary>
+      <p>The lead can see and type into the coding-agent terminals that K.O.D.E. starts on this laptop (not your whole desktop), start agents in your
+      <code>kode-workspace</code> folder, and run git and test commands there for team projects. Commits are made with your own git identity and pushed with
+      your own GitHub login. You can pull the kill switch at any time from your member console, whose link the agent prints when it connects.</p>
+    </details>
+  </section>
+</main>
+</body>
+</html>
