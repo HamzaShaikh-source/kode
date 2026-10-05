@@ -130,3 +130,20 @@ Evidence:
   Antigravity needed no permission answers at all (before Turbo: about one prompt per command).
 Not verified: macOS/Linux installer on a real Mac/Linux machine (script reviewed, not run); a real second physical laptop over Wi-Fi or a
 tunnel (all joins ran on this PC); cloudflared is not installed here.
+
+## v6 resilience (2026-10-05)
+Bugs found and fixed: an offline laptop's session was treated as dead (task restarted, blocked after ~9 s); a network error during merge left the task
+stuck in "review" forever; a dead agent with partial commits was merged half-finished; a Brain restart paused projects until a manual Resume and could
+start a second agent on a task that already had one; two agents for one machine fought over the connection.
+Evidence (`tests/test_resilience.py`, 10 tests, real hub + real node processes + scripted agents): offline-is-not-dead, backoff and 20-minute grace,
+review-never-stranded, coordinator failover (unit); Wi-Fi blip mid-task (same sid, no restart, project done); agent process killed and restarted
+(same branch, project done); Brain restart (auto-resume, project done); double start (old agent exits); revoked token (exit code 3).
+Not verified: real Wi-Fi loss / laptop sleep (simulated by closing the socket and killing the process); `--continue` resume was checked to start
+fresh when there is no conversation, not across a real mid-task kill of Claude Code or Antigravity.
+
+## v6.1 late setup + rejoin (2026-10-05)
+Reported: a teammate installed and signed in to Antigravity AFTER joining and it never showed up; rejoining with a new invite said "auth failed".
+Causes: the agent reported providers only at connect time (and a running Windows process never sees a new PATH); `--pair` was ignored whenever a saved token existed, so the stale token was sent.
+Fixes: 15 s rescan with PATH refresh (registry + common folders), `providers` update message, Rescan button, signed-in check (Claude `auth status`, Codex `login status`; others unknown), pre-flight error before a project starts; a fresh invite always re-pairs, a bad invite falls back to the saved login, and the old offline entry for the same person/machine is replaced.
+Tests (`test_resilience.py`): tool appearing after start without restart (real node process), stale token + new invite, bad invite + good saved login, rejoin leaves one entry. Not verified: Antigravity sign-in state (it has no cheap status command, shown as unknown).
+Windows Defender finding: the one-liner `powershell -ExecutionPolicy Bypass -Command "irm <url> | iex"` was BLOCKED by Defender on this PC (Get-MpThreatDetection shows the command line; CreateProcess returns Access denied), after working earlier. The Windows join flow now uses a downloaded `kode-join.ps1` (BOM + CRLF) run with `-File`; verified end to end over the LAN address with a stale saved login present (joined in 30 s, registration replaced). Defender settings were not changed.

@@ -384,8 +384,8 @@ body:not(.rm) .sk { animation: shimmer 1.4s linear infinite; } @keyframes shimme
 .pcard h3 { font: 600 17px var(--serif); } .pbrief { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .pbar { display: grid; gap: 6px; } .phead { display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; align-items: flex-start; }
 .ptitle { font: 600 24px var(--serif); } .pacts { display: flex; gap: 8px; }
-.steps { list-style: none; margin: 0; padding: 0; display: flex; gap: 6px; flex-wrap: wrap; } .steps li { padding: 5px 12px; border-radius: 99px; background: var(--hover); color: var(--ink-3); font-size: 12.5px; font-weight: 600; }
-.steps li.done { background: var(--ok-soft); color: var(--ok); } .steps li.now { background: var(--accent-soft); color: var(--accent); box-shadow: 0 0 0 1px var(--accent-line); }
+.psteps { list-style: none; margin: 0; padding: 0; display: flex; gap: 6px; flex-wrap: wrap; } .psteps li { padding: 5px 12px; border-radius: 99px; background: var(--hover); color: var(--ink-3); font-size: 12.5px; font-weight: 600; }
+.psteps li.done { background: var(--ok-soft); color: var(--ok); } .psteps li.now { background: var(--accent-soft); color: var(--accent); box-shadow: 0 0 0 1px var(--accent-line); }
 .note.ok { background: var(--ok-soft); border-color: color-mix(in srgb, var(--ok) 30%, var(--line)); }
 .lanes { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(260px, 100%), 1fr)); gap: 14px; align-items: start; } .lane-b { padding: 12px; display: grid; gap: 10px; }
 .tcard { border: 1px solid var(--line); border-radius: 11px; padding: 10px 12px; display: grid; gap: 6px; background: var(--card-2); } .tcard.running { border-color: var(--accent-line); } .tcard.blocked { border-color: var(--bad); } .tcard.merged { opacity: .78; }

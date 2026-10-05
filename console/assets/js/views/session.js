@@ -187,7 +187,7 @@ export function mount(root, sid) {
       else if (u.model) p.append(h('dl', { class: 'kv', style: { marginBottom: '14px' } }, kv('Model', u.model)));
       if (known) p.append(h('dl', { class: 'kv', style: { marginBottom: '14px' } }, kv('Input tokens', fmtNum(u.input_tokens)), kv('Output tokens', fmtNum(u.output_tokens)), kv('Cache read', fmtNum(u.cache_read || 0)), kv('Cache written', fmtNum(u.cache_write || 0)),
         u.messages != null ? kv('Model messages', u.messages) : null, u.reasoning_tokens ? kv('Reasoning tokens', fmtNum(u.reasoning_tokens)) : null, kv('Cost (estimate)', s.cost_estimate != null ? '$' + s.cost_estimate.toFixed(4) + ' at your prices' : 'unknown (no prices set)')));
-      p.append(h('div', { class: 'faint', style: { fontSize: '12px', fontWeight: 600, letterSpacing: '.04em', textTransform: 'uppercase', margin: '4px 0 8px' } }, 'Terminal activity'),
+      p.append(h('div', { class: 'mlabel' }, 'Terminal activity'),
         h('dl', { class: 'kv' }, kv('Output volume', fmtBytes(u.bytes_out || s.bytes_out || 0)), kv('Active time', mmss(u.active_seconds || 0))));
     });
     const evs = S.events.filter((e) => e.sid === sid).slice(-30).reverse();

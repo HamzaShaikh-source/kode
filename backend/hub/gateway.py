@@ -123,6 +123,7 @@ class NodeConn:
         self.member_name, self.access = "", "ask"
         self.accepted = "ask"
         self.info: dict = {}
+        self.connected_at = 0.0
 
     def public(self, hub_host: str) -> dict:
         return {"id": self.id, "name": self.name, "hostname": self.hostname, "os": self.os, "online": self.online,
@@ -178,7 +179,7 @@ class Hub:
     # ───────────── lifecycle ─────────────
     def start(self) -> None:
         self.loop = asyncio.get_running_loop()
-        self._bg = [asyncio.create_task(self._ticker())]
+        self._bg = [asyncio.create_task(self._ticker()), asyncio.create_task(self.projects.auto_resume())]
 
     async def stop(self) -> None:
         for t in self._bg:
@@ -321,6 +322,12 @@ class Hub:
                     await ws.close(code=4401)
                     return
                 mname = inv["member_name"] or clip(first.get("name", "machine"), 60)
+                for old in [x for x in self.nodes.values() if not x.online and x.hostname == clip(first.get("hostname", "?"), 80) and (x.member_name or "") == mname]:
+                    self.nodes.pop(old.id, None)                           # the same person rejoining from the same machine replaces their old (offline) entry
+                    for osid in list(old.sessions):
+                        self.sessions.pop(osid, None)
+                    self.store.remove_node(old.id)
+                    self.event("pair", f"{mname}'s machine rejoined; the old offline entry was replaced", old.id, actor="system")
                 made = self.store.create_node(clip(first.get("name") or mname, 60), clip(first.get("hostname", "?"), 80), clip(first.get("os", "?"), 40), mname, inv["access"])
                 await ws.send_text(jdump(t="paired", member_name=mname, access=inv["access"], **made))
                 self.event("pair", f"{mname}'s machine paired (access policy: {inv['access']})", made["node_id"], actor="system")
@@ -340,10 +347,12 @@ class Hub:
             node.accepted = ok if ok in lv else "ask"
             if want != node.access:
                 self.event("access", f"{node.member_name}'s machine only allows '{node.access}' access (lead set '{want}')", node.id, actor="system")
-            await ws.send_text(jdump(t="ready", node_id=node.id, hub_host=self.hostname))
+            alt = [u for u in [self.net_info().get("team_url")] + self.net_info().get("lan_urls", []) if u]
+            await ws.send_text(jdump(t="ready", node_id=node.id, hub_host=self.hostname, alt_hubs=alt[:6]))
             await self._reattach(node, first.get("sessions") or [])
             asyncio.create_task(self._readiness(node))
             self.event("online", f"{node.name} connected ({len(node.providers)} providers)", node.id, audit=False)
+            self.projects.node_back(node.id)
             while True:
                 raw = await ws.receive_text()
                 if len(raw) > MAX_FRAME * 8:
@@ -355,6 +364,12 @@ class Hub:
             if node and node.ws is ws:
                 await self._node_offline(node, "disconnected")
 
+    async def _close_quiet(self, ws: WebSocket, code: int) -> None:
+        try:
+            await ws.close(code=code)
+        except Exception:
+            pass
+
     def _register_node(self, ws: WebSocket, hello: dict) -> NodeConn:
         nid = hello["node_id"]
         n = self.nodes.get(nid) or NodeConn(nid, "", "", "")
@@ -363,7 +378,10 @@ class Hub:
         n.roots = [str(r) for r in (hello.get("roots") or [])][:10]
         n.allow_remote_start = bool(hello.get("allow_remote_start"))
         n.version = str(hello.get("version", ""))
-        n.ws, n.online, n.last_seen = ws, True, time.time()
+        old = n.ws
+        if old is not None and old is not ws and n.online:
+            asyncio.create_task(self._close_quiet(old, 4409))                       # "replaced by a newer connection": the old agent exits instead of fighting
+        n.ws, n.online, n.last_seen, n.connected_at = ws, True, time.time(), time.time()
         self.nodes[nid] = n
         self.store.touch_node(nid, n.name, n.hostname, n.os)
         return n
@@ -397,6 +415,7 @@ class Hub:
                 if s.mode != "watch":
                     s.mode, s.mode_expires = "watch", 0.0
         self.event("offline", f"{node.name} {why}", node.id, audit=False)
+        self.projects.node_gone(node.id)
 
     async def _send_node(self, node_id: str, **msg: Any) -> bool:
         n = self.nodes.get(node_id)
@@ -421,6 +440,16 @@ class Hub:
                 s.ring_len, s.truncated = 0, False
             s.push(m["d"])
             await self._to_viewers(sid, t="out", sid=sid, d=m["d"], seq=s.seq)
+        elif t == "providers":
+            old = {p.get("id"): p for p in node.providers}
+            node.providers = [p for p in (m.get("providers") or []) if isinstance(p, dict)][:30]
+            for p in node.providers:
+                before = old.get(p.get("id"), {})
+                if p.get("available") and not before.get("available"):
+                    self.event("provider", f"{p.get('label', p.get('id'))} is now available on {node.name}", node.id, audit=False)
+                elif p.get("available") and p.get("signed_in") is True and before.get("signed_in") is False:
+                    self.event("provider", f"{p.get('label', p.get('id'))} is now signed in on {node.name}", node.id, audit=False)
+            self.mark_dirty()
         elif t == "opres":
             fut = self._ops.pop(str(m.get("id", "")), None)
             if fut and not fut.done():
@@ -755,6 +784,9 @@ class Hub:
                 self.store.set_setting("team_url", url)
                 self.event("config", f"team URL set to {url or '(automatic)'}", actor=ROLE_LEAD)
                 await v.send(t="result", ref=m.get("ref"), ok=True, **self.net_info())
+        elif t == "rescan_node" and lead and m.get("node") in self.nodes:
+            await self._send_node(m["node"], t="rescan")
+            await v.send(t="result", ref=m.get("ref"), ok=True)
         elif t == "set_access" and lead and m.get("node") in self.nodes and m.get("access") in ACCESS_LEVELS:
             n = self.nodes[m["node"]]
             self.store.set_node_access(n.id, m["access"])

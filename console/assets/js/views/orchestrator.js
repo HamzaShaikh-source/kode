@@ -53,7 +53,7 @@ export function mount(root) {
       h('div', { class: 'om-t' }, m.text), m.thought ? h('div', { class: 'om-th' }, m.thought) : null);
     return el;
   }
-  let shown = '';
+  let shown = null;                                // null so the empty state paints on the first update too
   function update() {
     const o = S.orch;
     if (!o) { setText(status, 'Connecting…'); return; }

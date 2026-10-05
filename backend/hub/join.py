@@ -123,9 +123,12 @@ foreach ($a in @('claude', 'codex', 'agy', 'opencode', 'hermes')) {{ if (Get-Com
 $Name = "$Member's $env:COMPUTERNAME"
 $Cfg = Join-Path $Dir 'node.json'
 $Agent = Join-Path $Dir 'app\\node\\agent.py'
-Set-Content -Encoding UTF8 (Join-Path $Dir 'start.ps1') "& '$vpy' '$Agent' --hub '$Brain' --name '$($Name -replace "'", "''")' --workspace '$Ws' --config '$Cfg'"
+$Run = "& '$vpy' '$Agent' --hub '$Brain' --name '$($Name -replace "'", "''")' --workspace '$Ws' --config '$Cfg'"
+# The agent restarts itself if it crashes and reconnects on its own when the network drops. Exit code 3 means only a new invite helps.
+Set-Content -Encoding UTF8 (Join-Path $Dir 'start.ps1') ($Run + [Environment]::NewLine + 'while ($LASTEXITCODE -ne 3) {{ Write-Host ''K.O.D.E. agent stopped; restarting in 5s (Ctrl+C to quit)''; Start-Sleep 5; ' + $Run + ' }}')
 Write-Host '4/4 connecting (keep this window open; Ctrl+C stops it, start.ps1 starts it again)' -ForegroundColor Cyan
 & $vpy $Agent --hub $Brain --pair $Code --name $Name --workspace $Ws --config $Cfg
+while ($LASTEXITCODE -ne 3 -and (Test-Path $Cfg)) {{ Write-Host 'K.O.D.E. agent stopped; restarting in 5s (Ctrl+C to quit)'; Start-Sleep 5; Invoke-Expression $Run }}
 """
 
 
@@ -157,10 +160,20 @@ for a in claude codex agy opencode hermes; do if command -v "$a" >/dev/null 2>&1
 NAME="$MEMBER's $(hostname)"
 CFG="$DIR/node.json"
 AGENT="$DIR/app/node/agent.py"
-printf '#!/bin/sh\\nexec %s %s --hub %s --name %s --workspace %s --config %s\\n' "$DIR/venv/bin/python" "$AGENT" "$BRAIN" "'$NAME'" "$WS" "$CFG" > "$DIR/start.sh"
+# The agent restarts itself if it crashes and reconnects on its own when the network drops. Exit code 3 means only a new invite helps.
+cat > "$DIR/start.sh" <<STARTEOF
+#!/bin/sh
+while true; do
+  "$DIR/venv/bin/python" "$AGENT" --hub "$BRAIN" --name "$NAME" --workspace "$WS" --config "$CFG"
+  rc=\\$?
+  if [ "\\$rc" = 3 ]; then exit 3; fi
+  echo "K.O.D.E. agent stopped; restarting in 5s (Ctrl+C to quit)"; sleep 5
+done
+STARTEOF
 chmod +x "$DIR/start.sh"
 echo "4/4 connecting (keep this window open; Ctrl+C stops it, $DIR/start.sh starts it again)"
-exec "$DIR/venv/bin/python" "$AGENT" --hub "$BRAIN" --pair "$CODE" --name "$NAME" --workspace "$WS" --config "$CFG"
+"$DIR/venv/bin/python" "$AGENT" --hub "$BRAIN" --pair "$CODE" --name "$NAME" --workspace "$WS" --config "$CFG" || [ $? -ne 3 ] || exit 3
+exec "$DIR/start.sh"
 """
 
 
@@ -202,7 +215,12 @@ def make_router(get_hub, console_dir: Path) -> APIRouter:
         _, info = guard(request, code)
         if info["status"] != "valid":
             raise HTTPException(410, f"this invite is {info['status']}; ask your lead for a new one")
-        return PlainTextResponse(install_ps1(base_url(request), code.upper(), info["member"]), headers={"Cache-Control": "no-store"})
+        body = install_ps1(base_url(request), code.upper(), info["member"])
+        if request.query_params.get("dl"):
+            # A saved file: UTF-8 with BOM so Windows PowerShell reads any non-ASCII name correctly, CRLF line endings.
+            return Response(("\ufeff" + body.replace("\r\n", "\n").replace("\n", "\r\n")).encode("utf-8"), media_type="application/octet-stream",
+                            headers={"Content-Disposition": 'attachment; filename="kode-join.ps1"', "Cache-Control": "no-store"})
+        return PlainTextResponse(body, headers={"Cache-Control": "no-store"})
 
     @r.get("/join/{code}/install.sh", include_in_schema=False)
     async def sh(code: str, request: Request):

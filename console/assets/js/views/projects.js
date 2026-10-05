@@ -23,7 +23,7 @@ export function openNewProject() {
   const rows = nodes.map((n, idx) => {
     const provs = (n.providers || []).filter((p) => p.available && p.id !== 'shell' && p.id !== 'opencode-free' && p.id !== 'demo-agent');
     const on = h('input', { type: 'checkbox', checked: true, 'aria-label': 'Include ' + (n.member_name || n.name) });
-    const sel = h('select', { 'aria-label': 'Agent for ' + (n.member_name || n.name) }, provs.map((p) => h('option', { value: p.id }, p.label)));
+    const sel = h('select', { 'aria-label': 'Agent for ' + (n.member_name || n.name) }, provs.map((p) => h('option', { value: p.id }, p.label + (p.signed_in === false ? ' (sign in needed)' : ''))));
     const order = ['claude', 'agy', 'codex'];                       // a mixed team by default; OpenCode and Hermes stay selectable
     const pref = [order[idx % order.length], ...order, 'opencode', 'hermes'].find((x) => provs.some((p) => p.id === x)); if (pref) sel.value = pref;
     const prof = h('select', { 'aria-label': 'Model source for ' + (n.member_name || n.name) }, h('option', { value: '' }, 'Own login'), S.profiles.map((p) => h('option', { value: p.id }, p.name)));
@@ -101,7 +101,7 @@ export function mount(root, arg) {
       h('div', {}, h('div', { class: 'prow-t' }, h('h2', { class: 'ptitle' }, p.name), chip(st, cls)), h('p', { class: 'muted', style: { maxWidth: '70ch' } }, p.brief),
         p.repo ? h('div', { class: 'faint mono', style: { fontSize: '12.5px' } }, p.forge === 'github' ? 'github.com/' + p.repo : p.repo) : null),
       acts));
-    wrap.append(h('ol', { class: 'steps', 'aria-label': 'Progress' }, PHASES.map(([k, l], i) => h('li', { class: i < phaseIdx || p.status === 'done' ? 'done' : i === phaseIdx ? 'now' : '' }, l))));
+    wrap.append(h('ol', { class: 'psteps', 'aria-label': 'Progress' }, PHASES.map(([k, l], i) => h('li', { class: i < phaseIdx || p.status === 'done' ? 'done' : i === phaseIdx ? 'now' : '' }, l))));
     if (p.note && p.status !== 'done') wrap.append(h('div', { class: 'note' }, p.note));
     if (p.error) {
       const rp = p.status === 'failed' && p.phase === 'plan' ? plannerPicker(S.nodes.filter((n) => n.online)) : null;
@@ -145,6 +145,7 @@ export function mount(root, arg) {
           const [ts_, tc] = TASK[t.status] || [t.status, ''];
           return h('div', { class: 'tcard ' + t.status }, h('div', { class: 'prow-t' }, h('b', {}, t.id), chip(ts_, tc), t.round ? chip('fix', 'warn') : null), h('div', {}, t.title),
             h('div', { class: 'faint', style: { fontSize: '12px' } }, `${t.commits || 0} commits${t.min_commits ? ' of at least ' + t.min_commits : ''}${t.violations ? ', ' + t.violations + ' scope fix' : ''}`),
+            t.wait ? h('div', { class: 'twait' }, icon('wifi', 12), t.wait + ' - retrying automatically') : null,
             h('div', { class: 'tcard-a' }, t.sid && ['running', 'starting', 'review'].includes(t.status) ? h('a', { class: 'btn sm', href: '#/session/' + t.sid }, icon('terminal', 12), 'Console') : null,
               t.pr_url && t.pr_url.startsWith('http') ? h('a', { class: 'btn sm', href: t.pr_url, target: '_blank', rel: 'noopener' }, 'PR') : null));
         })));
@@ -178,7 +179,7 @@ export function mount(root, arg) {
     const y = window.scrollY; detail(p); window.scrollTo(0, y);
   }
   return {
-    meta: () => { const p = arg ? S.projects.find((x) => x.id === arg) : null; return { title: p ? p.name : 'Projects', sub: p ? 'Plan, build, merge, verify' : 'One brief, the whole team building', actions: arg ? [{ key: 'back', el: h('a', { class: 'btn', href: '#/projects' }, 'All projects') }] : [{ key: 'new', el: newBtn }] }; },
+    meta: () => { const p = arg ? S.projects.find((x) => x.id === arg) : null; return { title: 'Projects', sub: p ? p.name : 'One brief, the whole team building', actions: arg ? [{ key: 'back', el: h('a', { class: 'btn', href: '#/projects' }, 'All projects') }] : [{ key: 'new', el: newBtn }] }; },
     update, destroy() {},
   };
 }

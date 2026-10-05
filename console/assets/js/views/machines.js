@@ -1,5 +1,5 @@
 import { S, sessionsOf } from '../store.js';
-import { h, icon, setText, reconcile, rel, clear } from '../util.js';
+import { h, icon, setText, reconcile, rel, clear, providerMeta } from '../util.js';
 import { chip, modal, toast } from '../components.js';
 import { openAddMachine, openNewSession } from '../dialogs.js';
 import * as hub from '../hubclient.js';
@@ -15,13 +15,14 @@ export function mount(root) {
     const r = {};
     const el = h('article', { class: 'card' },
       h('div', { class: 'card-h' }, h('span', { class: 'mach-ic' }, icon('laptop', 19)), h('div', { style: { flex: 1, minWidth: 0 } }, r.name = h('h3'), r.sub = h('small', { class: 'faint' })), r.badges = h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap' } }),
-        r.newBtn = h('button', { class: 'btn sm', type: 'button' }, icon('play', 13), 'New session'), r.rm = h('button', { class: 'btn sm danger', type: 'button', 'aria-label': 'Remove machine' }, icon('trash', 14))),
+        r.scan = h('button', { class: 'btn sm', type: 'button', 'aria-label': 'Rescan installed agents' }, icon('bolt', 13), 'Rescan'), r.newBtn = h('button', { class: 'btn sm', type: 'button' }, icon('play', 13), 'New session'), r.rm = h('button', { class: 'btn sm danger', type: 'button', 'aria-label': 'Remove machine' }, icon('trash', 14))),
       h('div', { class: 'card-b', style: { display: 'grid', gap: '14px' } },
-        h('div', {}, h('div', { class: 'faint', style: { fontSize: '12px', fontWeight: 600, letterSpacing: '.04em', textTransform: 'uppercase', marginBottom: '8px' } }, 'Providers on this machine'), r.provs = h('div', { style: { display: 'flex', gap: '8px', flexWrap: 'wrap' } })),
-        h('div', {}, h('div', { class: 'faint', style: { fontSize: '12px', fontWeight: 600, letterSpacing: '.04em', textTransform: 'uppercase', marginBottom: '8px' } }, 'Ready for projects'), r.ready = h('div', { style: { display: 'flex', gap: '8px', flexWrap: 'wrap' } })),
-        h('div', {}, h('div', { class: 'faint', style: { fontSize: '12px', fontWeight: 600, letterSpacing: '.04em', textTransform: 'uppercase', marginBottom: '8px' } }, 'Workspace roots (sessions cannot leave these)'), r.roots = h('div', { class: 'mono', style: { fontSize: '12.5px' } })),
+        h('div', {}, h('div', { class: 'mlabel' }, 'Agents installed'), r.provs = h('div', { style: { display: 'flex', gap: '8px', flexWrap: 'wrap' } })),
+        h('div', {}, h('div', { class: 'mlabel' }, 'Ready for projects'), r.ready = h('div', { style: { display: 'flex', gap: '8px', flexWrap: 'wrap' } })),
+        h('div', {}, h('div', { class: 'mlabel' }, 'Workspace folder (sessions stay inside it)'), r.roots = h('div', { class: 'mono', style: { fontSize: '12.5px' } })),
         r.meta = h('div', { class: 'faint', style: { fontSize: '12.5px' } })));
     r.newBtn.addEventListener('click', () => openNewSession(el._id));
+    r.scan.addEventListener('click', async () => { r.scan.disabled = true; try { await hub.call({ t: 'rescan_node', node: el._id }); toast('Rescanning agents on that laptop...'); } catch (e) { toast(e.message, 'bad'); } setTimeout(() => { r.scan.disabled = false; }, 2500); });
     r.rm.addEventListener('click', () => {
       const close = modal({ title: 'Remove this teammate?', body: h('p', { class: 'muted' }, `${el._name} will be disconnected and must be paired again with a new code. Its sessions disappear from the Brain.`),
         actions: [h('button', { class: 'btn', type: 'button', onclick: () => close() }, 'Cancel'), h('button', { class: 'btn danger solid', type: 'button', onclick: () => { hub.send({ t: 'remove_node', node: el._id }); close(); toast('Machine removed'); } }, 'Remove')] });
@@ -33,10 +34,12 @@ export function mount(root) {
     setText(r.name, n.member_name && n.member_name !== n.name ? `${n.member_name} (${n.name})` : n.name); setText(r.sub, `${n.hostname} · ${n.os}${n.version ? ' · agent v' + n.version : ''}`);
     r.newBtn.disabled = !n.online;
     const k = JSON.stringify([n.online, n.same_host, n.allow_remote_start, n.providers, n.roots, n.access, n.info]);
+    r.scan.disabled = !n.online;
     if (r.badges._k !== k) {
       r.badges._k = k;
       r.badges.replaceChildren(...[chip(n.online ? 'Online' : 'Offline', n.online ? 'ok' : 'bad'), n.same_host ? chip('same PC as the Brain', 'info') : null, chip({ ask: 'Ask each time', copilot: 'Co-pilot allowed', full: 'Full access' }[n.access || 'ask'], n.access === 'full' ? 'accent' : n.access === 'copilot' ? 'warn' : '', 'hand'), n.access !== 'full' ? h('button', { class: 'btn sm', type: 'button', onclick: async () => { const x = await hub.call({ t: 'set_access', node: n.id, access: 'full' }); toast(x.ok ? 'Full access set (applies if the machine allows it)' : 'Could not change access', x.ok ? '' : 'bad'); } }, 'Give full access') : null, chip(n.allow_remote_start ? 'Lead may start sessions' : 'Starts need approval', n.allow_remote_start ? 'warn' : '', 'lock')].filter(Boolean));
-      r.provs.replaceChildren(...(n.providers || []).map((p) => chip(p.label, p.available ? 'ok' : '', p.available ? 'check' : 'x')));
+      r.provs.replaceChildren(...(n.providers || []).filter((p) => p.available && p.id !== 'demo-agent').map((p) => { const pm = providerMeta(p.id, p.label); return h('span', { class: 'agent-chip' + (p.signed_in === false ? ' warn' : '') }, h('span', { class: 'pg', style: { background: pm.color } }, pm.letter), p.label, p.signed_in === false ? h('small', {}, 'sign in needed') : p.signed_in === true ? h('small', { class: 'ok' }, 'signed in') : null); }));
+      if (!(n.providers || []).some((p) => p.available && p.id !== 'demo-agent' && p.id !== 'shell')) r.provs.append(h('span', { class: 'faint' }, 'No coding agent found yet. Install one (Claude Code, Codex, Antigravity...), sign in, then press Rescan. It also appears on its own within about 15 seconds.'));
       const inf = n.info || {};
       r.ready.replaceChildren(...(inf.checked ? [chip(inf.git ? 'git installed' : 'git missing', inf.git ? 'ok' : 'bad', inf.git ? 'check' : 'x'), chip(inf.gh ? `GitHub: ${inf.gh_user || 'logged in'}` : 'GitHub CLI not logged in (gh auth login)', inf.gh ? 'ok' : 'bad', inf.gh ? 'check' : 'x'), chip(inf.git_email ? `commits as ${inf.git_name || ''} <${inf.git_email}>` : 'no git email set', inf.git_email ? 'ok' : 'warn')] : [h('span', { class: 'faint' }, n.online ? 'Checking...' : 'Offline')]));
       r.roots.replaceChildren(...(n.roots || []).map((x) => h('div', {}, x)));

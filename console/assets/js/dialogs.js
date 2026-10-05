@@ -150,7 +150,7 @@ export function openNewSession(preNodeId = '') {
   if (preNodeId && nodes.some((n) => n.id === preNodeId)) mSel.value = preNodeId;
   const refresh = () => {
     const n = nodeById(mSel.value);
-    clear(pSel).append(...(n.providers || []).map((p) => h('option', { value: p.id, disabled: !p.available }, p.label + (p.available ? '' : ' (not installed)'))));
+    clear(pSel).append(...(n.providers || []).map((p) => h('option', { value: p.id, disabled: !p.available }, p.label + (p.available ? (p.signed_in === false ? ' (sign in needed)' : '') : ' (not installed)'))));
     const firstOk = (n.providers || []).find((p) => p.available);
     if (firstOk) pSel.value = firstOk.id;
     paintProfiles();

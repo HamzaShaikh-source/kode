@@ -6,6 +6,7 @@ import * as pool from './termpool.js';
 import { toast } from './components.js';
 import { openAddMachine, openNewSession } from './dialogs.js';
 import * as shortcuts from './shortcuts.js';
+import { initPalette, openPalette } from './palette.js';
 import * as brain from './views/brain.js';
 import * as sessions from './views/sessions.js';
 import * as session from './views/session.js';
@@ -20,6 +21,7 @@ import * as projects from './views/projects.js';
 
 const VIEWS = { brain, sessions, session, machines, team: machines, models, orchestrator, projects, usage, activity, settings, home };
 const LEAD_NAV = [['brain', 'Brain', 'brain'], ['projects', 'Projects', 'branch'], ['orchestrator', 'Orchestrator', 'bolt'], ['sessions', 'Sessions', 'grid'], ['team', 'Team', 'user'], ['models', 'Models', 'key'], ['usage', 'Usage', 'chart'], ['activity', 'Activity', 'pulse'], ['settings', 'Settings', 'sliders']];
+const GROUPS = { lead: { 0: 'Build', 4: 'Team', 6: 'Insight' }, member: { 0: 'Workspace' } };
 const MEMBER_NAV = [['home', 'My machine', 'laptop'], ['sessions', 'Sessions', 'grid'], ['activity', 'Activity', 'pulse'], ['settings', 'Privacy', 'shield']];
 
 const params = new URLSearchParams(location.search);
@@ -33,10 +35,11 @@ const canType = (sid) => {
   if (!s || s.state !== 'live') return false;
   return isLead() ? ['copilot', 'takeover'].includes(s.mode) : s.mode !== 'takeover';
 };
-let lastBlock = 0;
+let lastBlock = 0, lastOffline = 0;
+const notConnected = () => { if (Date.now() - lastOffline < 3000) return; lastOffline = Date.now(); toast('Not connected to the Brain right now. What you typed was not sent; it reconnects automatically.', 'bad'); };
 pool.setIO({
   sendReply: (sid, d) => hub.send({ t: 'reply', sid, d }),
-  sendInput: (sid, d) => hub.send({ t: 'in', sid, d }),
+  sendInput: (sid, d) => { if (!hub.send({ t: 'in', sid, d })) notConnected(); },
   canType,
   blocked: (sid) => {
     if (Date.now() - lastBlock < 2500) return;
@@ -54,26 +57,26 @@ function buildSide() {
   const items = isLead() ? LEAD_NAV : MEMBER_NAV;
   nav = {};
   const connDot = h('span', { class: 'dot' }), connT = h('b'), connS = h('small', { class: 'faint' });
-  const theme = h('button', { class: 'btn ghost icon-btn', type: 'button', 'aria-label': 'Toggle dark mode', onclick: () => {
+  const theme = h('button', { class: 'nav-ext', type: 'button', onclick: () => {
     const t = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
     document.documentElement.dataset.theme = t; localStorage.setItem('kode.theme', t); paintTheme();
   } });
-  const paintTheme = () => { clear(theme).append(icon(document.documentElement.dataset.theme === 'dark' ? 'sun' : 'moon', 17)); };
+  const paintTheme = () => { const d = document.documentElement.dataset.theme === 'dark'; clear(theme).append(icon(d ? 'sun' : 'moon', 16), d ? 'Light mode' : 'Dark mode'); };
   paintTheme();
   sideEl.append(
     h('div', { class: 'logo' }, h('div', { class: 'logo-mark' }, icon('brain', 20, '')), h('div', {}, h('b', {}, 'K.O.D.E.'), h('small', {}, 'Agent command center'))),
     h('div', { class: 'team' }, h('span', { class: 'av' }, isLead() ? 'L' : 'M'), h('div', {}, isLead() ? 'Team lead' : 'Team member', h('small', {}, isLead() ? 'You see every machine' : 'You see only your machine'))),
-    h('div', { class: 'nav-label' }, 'Workspace'),
-    h('nav', { class: 'nav', 'aria-label': 'Sections' }, items.map(([id, label, ic]) => {
+    h('nav', { class: 'nav', 'aria-label': 'Sections' }, items.map(([id, label, ic], i) => {
       const cnt = h('span', { class: 'count', hidden: true });
       const a = h('a', { href: '#/' + id }, icon(ic, 18), h('span', { class: 'l' }, label), cnt);
       nav[id] = { a, cnt };
-      return a;
+      const grp = (GROUPS[isLead() ? 'lead' : 'member'] || {})[i];
+      return grp ? [h('div', { class: 'nav-label', role: 'presentation' }, grp), a] : a;
     })),
     h('div', { class: 'side-foot' },
       h('a', { class: 'nav-ext', href: '/guide', target: '_blank', rel: 'noopener' }, icon('list', 16), 'How to use', h('span', { class: 'sr' }, ' (opens in a new tab)')),
       h('button', { class: 'nav-ext', type: 'button', onclick: () => shortcuts.showHelp() }, icon('terminal', 16), 'Keyboard shortcuts', h('kbd', {}, '?')),
-      h('div', { class: 'conn' }, connDot, h('div', {}, connT, connS)), theme));
+      theme, h('div', { class: 'conn' }, connDot, h('div', {}, connT, connS))));
   topRefs.conn = { dot: connDot, t: connT, s: connS };
 }
 
@@ -93,7 +96,8 @@ function showGate() {
 
 function buildTop() {
   topRefs.title = h('h1'); topRefs.sub = h('div', { class: 'sub' }); topRefs.acts = h('div', { class: 'acts' });
-  topEl.append(h('div', { class: 'grow' }, topRefs.title, topRefs.sub), topRefs.acts);
+  const cmdk = h('button', { class: 'cmdk-btn', type: 'button', 'aria-label': 'Search and jump (Ctrl+K)', onclick: () => openPalette() }, icon('search', 14), h('span', {}, 'Search or jump to...'), h('kbd', {}, navigator.platform.includes('Mac') ? '⌘K' : 'Ctrl K'));
+  topEl.append(h('div', { class: 'grow' }, topRefs.title, topRefs.sub), cmdk, topRefs.acts);
 }
 
 function parseRoute() {
@@ -154,7 +158,7 @@ function paint() {
   if (cur.update) cur.update();
 }
 
-buildSide(); buildTop(); shortcuts.init();
+buildSide(); buildTop(); shortcuts.init(); initPalette();
 window.addEventListener('hashchange', go);
 subscribe(() => { go(); paint(); });
 window.__kode = { S, hub, pool, openAddMachine, openNewSession };

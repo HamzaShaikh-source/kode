@@ -15,7 +15,7 @@
   <nav aria-label="Main"><a href="/">Overview</a><a class="btn primary" href="/console">Open the console</a></nav>
 </div></header>
 <div class="wrap doc">
-  <nav class="toc" aria-label="On this page"><a href="#start">Start the Brain</a><a href="#hackathon">At a hackathon</a><a href="#invite">Invite a teammate</a><a href="#join">Join as a teammate</a><a href="#project">Run a project</a><a href="#watch">Watch and control</a><a href="#models">Custom endpoints</a><a href="#orch">Orchestrator</a><a href="#usage">Usage and context</a><a href="#safety">Safety model</a><a href="#trouble">Troubleshooting</a></nav>
+  <nav class="toc" aria-label="On this page"><a href="#start">Start the Brain</a><a href="#hackathon">At a hackathon</a><a href="#invite">Invite a teammate</a><a href="#join">Join as a teammate</a><a href="#project">Run a project</a><a href="#watch">Watch and control</a><a href="#models">Custom endpoints</a><a href="#orch">Orchestrator</a><a href="#usage">Usage and context</a><a href="#safety">Safety model</a><a href="#resilience">When things drop</a><a href="#trouble">Troubleshooting</a></nav>
   <article>
     <h1>How to use K.O.D.E.</h1>
     <p>The Brain is a small server you run. Teammates run a tiny agent that connects outward to it. You open the console in a browser.</p>
@@ -40,7 +40,7 @@
     <p>When their machine connects, the Team page lists it with what it is ready for: git installed, GitHub CLI logged in, and the identity its commits will use.</p>
 
     <h2 id="join">Join as a teammate</h2>
-    <p>Open the link from your lead on your own laptop. The page shows one command for Windows (PowerShell) or macOS and Linux. It downloads a small agent from your lead's Brain into <code>kode-node</code> in your home folder, sets up a private Python environment, checks git, the GitHub CLI and your coding agents, and connects. You can read the script first with the button next to it.</p>
+    <p>Open the link from your lead on your own laptop. On Windows the page has a <b>Download installer</b> button (a plain-text <code>kode-join.ps1</code> you can read first) and one command to run it in PowerShell; Windows Defender blocks the usual one-line download-and-run trick, so we do not use it. On macOS and Linux it is a single <code>curl | sh</code> command. It downloads a small agent from your lead's Brain into <code>kode-node</code> in your home folder, sets up a private Python environment, checks git, the GitHub CLI and your coding agents, and connects. You can read the script first with the button next to it.</p>
     <p>Next time, run <code>start.ps1</code> (Windows) or <code>~/kode-node/start.sh</code>. Your member console link, with the kill switch, is printed when the agent connects. Projects are cloned into <code>kode-workspace</code> in your home folder, and commits use your own git identity and GitHub login.</p>
 
     <h2 id="project">Run a project</h2>
@@ -74,12 +74,28 @@
     <h2 id="safety">Safety model</h2>
     <ul><li>Machines connect outward only. No inbound ports on teammates' laptops.</li><li>Control is enforced by the Brain and again by each teammate's agent.</li><li>Keys are encrypted at rest, injected into one session, and redacted from its output.</li><li>Pairing, starts, grants and the lead's input are written to an audit log.</li></ul>
 
+    <h2 id="resilience">When Wi-Fi drops, laptops restart, or the Brain restarts</h2>
+    <p>A project is built to ride out the failures that happen at hackathons. Nothing needs a click unless this page says so.</p>
+    <table><thead><tr><th>What happens</th><th>What K.O.D.E. does</th></tr></thead><tbody>
+      <tr><td>A teammate's Wi-Fi drops for a moment</td><td>Their agent keeps working locally and reconnects by itself. The same terminal session continues; the task is not restarted. The task card shows "waiting" until they are back.</td></tr>
+      <tr><td>A laptop stays offline for a while</td><td>Its tasks wait and retry with a growing delay for up to 20 minutes, then ask you. If the laptop that merges and verifies goes offline, another online teammate takes that role.</td></tr>
+      <tr><td>A teammate closes the window or reboots</td><td>They run <code>start.ps1</code> (or <code>~/kode-node/start.sh</code>) again. Their task restarts on the same branch with the work already committed, and Claude Code and Antigravity pick their previous conversation back up.</td></tr>
+      <tr><td>The agent crashes</td><td>The start script restarts it after 5 seconds. Starting it twice leaves one running: the newer one wins.</td></tr>
+      <tr><td>The lead restarts the Brain</td><td>Laptops reconnect on their own, running projects resume automatically, and unfinished work is kept.</td></tr>
+      <tr><td>GitHub is unreachable or slow</td><td>Pushes, pull requests and merges retry automatically. A task is never stranded half-merged.</td></tr>
+      <tr><td>The Brain's address changes (new hotspot IP)</td><td>Laptops remember the Brain's other addresses and try them. If none work, use a fresh invite link.</td></tr>
+      <tr><td>A machine was removed or the Brain was reset</td><td>Its agent stops and says it needs a new invite link.</td></tr>
+    </tbody></table>
+    <p>If you reload the console, or it loses the connection, it reconnects by itself, replays every terminal, and warns you instead of silently dropping what you type.</p>
+
     <h2 id="trouble">Troubleshooting</h2>
     <table><thead><tr><th>Symptom</th><th>Fix</th></tr></thead><tbody>
       <tr><td>Console asks for a key</td><td>Open it on the Brain's computer, or paste the contents of <code>backend/.hub_key</code>.</td></tr>
       <tr><td>Invite code rejected</td><td>Codes are single use and last 10 minutes. Create a new one.</td></tr>
       <tr><td>Profile greyed out for a provider</td><td>The protocol does not match that agent. See the table on the Models page.</td></tr>
       <tr><td>Context shows unknown</td><td>That tool does not expose it. Set a context window on the profile for custom endpoints.</td></tr>
+      <tr><td>A teammate installed or signed in to an agent after joining</td><td>Nothing to redo: their agent re-checks every 15 seconds, so it appears on the Team page by itself. Press <b>Rescan</b> on their machine card to check right now. A "sign in needed" badge means it is installed but not signed in (run it once on that laptop).</td></tr>
+      <tr><td>"Auth failed" when joining again</td><td>Run the new invite command again. A new invite always replaces an old saved login, and the old offline entry for the same person is replaced. If the invite itself is wrong or used, the agent falls back to its previous registration.</td></tr>
       <tr><td>Locked out after wrong keys</td><td>Eight failures in five minutes pause attempts from that address. Wait and retry.</td></tr></tbody></table>
   </article>
 </div>

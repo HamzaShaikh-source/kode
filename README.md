@@ -49,7 +49,7 @@ No `.env` is needed for projects: the planner can be Claude Code or Codex using 
    `cloudflared tunnel --url http://localhost:8000`) and start with `python run_kode.py --public-url https://<your-tunnel>`.
 2. **Invite.** Console → **Team** → **Invite teammate**. Choose their name, how long the link works and your access (*Full access* is the
    default), check the address teammates use, and send them the link.
-3. **Join.** Each teammate opens the link on their laptop and runs the one command it shows. It installs a small agent into
+3. **Join.** Each teammate opens the link on their laptop and runs the one command it shows. On Windows it is a downloaded `kode-join.ps1` run with `powershell -ExecutionPolicy Bypass -File` (Defender blocks the one-line `irm | iex` pattern). It installs a small agent into
    `~/kode-node`, checks git / GitHub CLI / agents, and connects. Next time they run `start.ps1` or `~/kode-node/start.sh`.
    The Team page shows who is ready (git installed, `gh` logged in, commit identity).
 4. **Project.** Console → **Projects** → **New project**: write the brief, pick each person's agent, pick the **Planner**
@@ -107,3 +107,9 @@ python -m pytest -q
 * Real agents' speed and quality vary; Antigravity and free models are noticeably slower.
 * Tested on Windows. The macOS/Linux installer and PTY path are implemented but not yet verified on real machines.
 * One task per laptop at a time; no live re-planning mid-build (use pause, reassign, or the automatic fix rounds).
+
+## Resilience
+Designed for flaky hackathon networks (details in `/guide`, tests in `backend/tests/test_resilience.py`): a Wi-Fi blip keeps the same agent session;
+offline laptops are waited for (20 min of retries with backoff) and the merge/verify role fails over to another online teammate; a killed or rebooted
+agent is restarted on the same branch (Claude Code / Antigravity resume their conversation); a Brain restart resumes running projects automatically;
+GitHub errors are retried; a second agent for the same machine replaces the first; start scripts restart a crashed agent.

@@ -302,7 +302,7 @@ def test_orchestrator_cannot_smuggle_control_characters_and_interrupt_is_its_own
             hub.hub.orch.llm_override = Scripted([{"tool": "send_task", "args": {"sid": sid, "text": "\x03\x1b[2J\necho CLEAN_TEXT_ONLY"}}, {"final": "ok"}])
             await lead.send(t="orch_say", text="go")
             await until(lambda: lead.out.get(sid, "").count("CLEAN_TEXT_ONLY") >= 2, 15)
-            assert any("Control characters were removed" in m["text"] for m in lead.orch["messages"])
+            await until(lambda: any("Control characters were removed" in m["text"] for m in lead.orch["messages"]), 10)       # the push to the console is debounced
             await until(lambda: lead.orch["status"] == "idle" and any(m["kind"] == "final" for m in lead.orch["messages"]), 15)
             # interrupt asks for approval when autonomy is 'ask' and the card names the action explicitly
             hub.hub.orch.autonomy = "ask"

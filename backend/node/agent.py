@@ -23,7 +23,7 @@ from typing import Dict, List, Optional
 import websockets
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from bridge.manifests import load_manifests, scrubbed_env           # noqa: E402
+from bridge.manifests import load_manifests, refresh_path, scan, scrubbed_env   # noqa: E402
 from bridge.pty_session import PtySession                          # noqa: E402
 from hub.protocol import MODES, is_terminal_reply, jdump, redact, valid_mode   # noqa: E402
 from node.collectors import COLLECTORS, Activity, git_info          # noqa: E402
@@ -56,6 +56,11 @@ class NodeAgent:
         self.http = u.replace("ws://", "http://").replace("wss://", "https://")
         self.ws_url = self.http.replace("http://", "ws://").replace("https://", "wss://") + "/hub/node"
         self.name, self.config_path, self.pair_code = name, config, pair
+        self.provs: List[dict] = []
+        self.pair_done = False
+        self.hubs = [self.ws_url]                                         # the address we were given first, then any the Brain told us about
+        self.hub_i = 0
+        self.need_invite = False
         self.access_limit = access_limit if access_limit in LEVELS else "full"
         if not accept_access:
             self.access_limit = "ask"
@@ -86,22 +91,39 @@ class NodeAgent:
     # ── main loop ──
     async def run(self) -> None:
         self.load()
-        delay = 1.0
+        for u in self.cfg.get("alt_hubs", []):
+            w = u.replace("http://", "ws://").replace("https://", "wss://").rstrip("/") + "/hub/node"
+            if w not in self.hubs:
+                self.hubs.append(w)
+        refresh_path()
+        self.provs = await asyncio.to_thread(scan, self.manifests)
+        delay, fails = 1.0, 0
         while not self.stop.is_set():
             try:
-                async with websockets.connect(self.ws_url, max_size=2**22, ping_interval=None) as ws:
+                # ping_interval: a half-open connection (Wi-Fi dropped, laptop slept) is noticed in ~35 s instead of "never"
+                async with websockets.connect(self.hubs[self.hub_i % len(self.hubs)], max_size=2**22, ping_interval=15, ping_timeout=20, open_timeout=10) as ws:
                     self.ws = ws
-                    if not await self._handshake(ws):
+                    ok = await self._handshake(ws)
+                    if ok is None:
+                        continue
+                    if not ok:
                         return
-                    delay = 1.0
-                    tasks = [asyncio.create_task(self._reader(ws)), asyncio.create_task(self._hb(ws)), asyncio.create_task(self._collect(ws))]
+                    delay, fails = 1.0, 0
+                    tasks = [asyncio.create_task(self._reader(ws)), asyncio.create_task(self._hb(ws)), asyncio.create_task(self._collect(ws)), asyncio.create_task(self._rescan_loop())]
                     done, pend = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
                     for t in pend:
                         t.cancel()
                     for t in done:
                         t.exception()
-            except (OSError, websockets.WebSocketException) as e:
-                self.log(f"hub unreachable ({type(e).__name__}); retrying in {delay:.0f}s")
+                    if getattr(ws, "close_code", None) == 4409:                   # another agent for this machine took over
+                        self.log("another K.O.D.E. agent started for this machine and took over; this one is stopping.")
+                        self.stop.set()
+                        return
+            except (OSError, websockets.WebSocketException, asyncio.TimeoutError) as e:
+                fails += 1
+                if fails % 3 == 0 and len(self.hubs) > 1:                     # the Brain's address may have changed (new hotspot IP): try the others
+                    self.hub_i += 1
+                self.log(f"hub unreachable ({type(e).__name__}); retrying in {delay:.0f}s" + (f" (next address: {self.hubs[self.hub_i % len(self.hubs)]})" if len(self.hubs) > 1 else ""))
             finally:
                 self.ws = None
             if self.stop.is_set():
@@ -110,7 +132,7 @@ class NodeAgent:
             delay = min(delay * 2, 15)
 
     def _hello(self) -> dict:
-        provs = [m.public() for m in self.manifests.values()]
+        provs = self.provs
         sess = [{"sid": h.sid, "provider": h.provider, "label": h.label, "cwd": h.cwd, "alive": h.pty.alive(),
                  "cols": h.cols, "rows": h.rows} for h in self.sessions.values()]
         return {"t": "hello", "node_id": self.cfg.get("node_id"), "token": self.cfg.get("token"), "name": self.name,
@@ -119,15 +141,25 @@ class NodeAgent:
                 "access_accepted": self.access_limit}
 
     async def _handshake(self, ws) -> bool:
-        if not self.cfg.get("token"):
+        want_pair = bool(self.pair_code) and not self.pair_done
+        if want_pair and self.cfg.get("token"):
+            self.log("A new invite code was given: joining again with it (the old saved registration is replaced).")
+        if want_pair or not self.cfg.get("token"):
             if not self.pair_code:
                 self.log("not paired: run with --pair <code> (create a code in the console: Add machine)")
+                self.need_invite = True
                 return False
             await ws.send(jdump(t="pair", code=self.pair_code, name=self.name, hostname=socket.gethostname(), os=platform.system()))
             r = json.loads(await ws.recv())
             if r.get("t") != "paired":
                 self.log("pairing failed:", r.get("d", r))
+                if self.cfg.get("token"):                         # the invite was bad but we were registered before: fall back to the saved login
+                    self.log("Using the previous registration instead.")
+                    self.pair_done = True
+                    return None
+                self.need_invite = True
                 return False
+            self.pair_done = True
             self.cfg = {"node_id": r["node_id"], "token": r["token"], "member_key": r["member_key"], "hub": self.http,
                         "member_name": r.get("member_name", ""), "access_accepted": "ask"}
             access = r.get("access", "ask")
@@ -144,12 +176,37 @@ class NodeAgent:
             self.log("rejected by hub:", r.get("d", r))
             if "authentication" in str(r.get("d", "")):
                 self.cfg = {}                                   # token no longer valid (machine was removed): need a new pairing
+                self.need_invite = True
+                self.log("This machine was removed from the team or the Brain was reset. Ask your lead for a new invite link and run its command again.")
             return False
+        alts = [str(u) for u in (r.get("alt_hubs") or []) if re.fullmatch(r"https?://[A-Za-z0-9.\-:\[\]]{1,255}", str(u))][:6]
+        if alts and alts != self.cfg.get("alt_hubs"):
+            self.cfg["alt_hubs"] = alts
+            self.save()
+            for u in alts:
+                w = u.replace("http://", "ws://").replace("https://", "wss://") + "/hub/node"
+                if w not in self.hubs:
+                    self.hubs.append(w)
         mk = self.cfg.get("member_key")
         self.log(f"connected to {self.http}  |  member console: {self.http}/console?member={mk}")
         for h in self.sessions.values():                         # push what we still host so the hub can rebuild its replay buffer
             await ws.send(jdump(t="out", sid=h.sid, d=h.pty.replay(), reset=True))
         return True
+
+    async def _rescan_loop(self) -> None:
+        """Re-check what is installed / signed in, so a tool the teammate sets up AFTER joining shows up on its own (no re-invite, no restart)."""
+        every = float(os.environ.get("KODE_RESCAN_S", "15"))
+        while True:
+            await asyncio.sleep(every)
+            await self.rescan()
+
+    async def rescan(self) -> None:
+        refresh_path()
+        new = await asyncio.to_thread(scan, self.manifests)
+        if json.dumps(new, sort_keys=True) != json.dumps(self.provs, sort_keys=True):
+            self.provs = new
+            await self._send(t="providers", providers=new)
+            self.log("providers changed: " + ", ".join(f"{p['id']}{'' if p['available'] else ' (missing)'}" for p in new if p["available"]))
 
     async def _hb(self, ws) -> None:
         while True:
@@ -193,6 +250,8 @@ class NodeAgent:
             h.pty.close()
         elif t == "op":
             asyncio.create_task(self._do_op(m))
+        elif t == "rescan":
+            asyncio.create_task(self.rescan())
         elif t == "config":
             self.allow_remote_start = bool(m.get("allow_remote_start"))
 
@@ -322,6 +381,8 @@ def main() -> None:
         pass
     finally:
         agent.shutdown()
+    if agent.need_invite:
+        sys.exit(3)                                              # start scripts do not restart-loop on this: only a new invite helps
 
 
 if __name__ == "__main__":

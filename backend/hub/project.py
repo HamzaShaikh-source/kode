@@ -37,6 +37,12 @@ TICK_S = 3.0
 IDLE_DONE_S = 40.0            # agent quiet this long after pushing >= min commits => task finished (marker shortens it)
 MARKER_IDLE_S = 6.0
 STALL_S = 480.0
+# Resilience: how long a transient problem (laptop offline, GitHub unreachable, Wi-Fi blip) is retried before a human is asked.
+NET_GRACE_S = 1200.0        # keep retrying for 20 minutes
+NET_BACKOFF = (3, 6, 12, 25, 45, 60)
+REATTACH_S = 20.0           # after a laptop reconnects, its sessions are re-announced within this window
+TRANSIENT = re.compile(r"offline|unreachable|timed out|timeout|unable to access|could not resolve|connection (reset|refused|closed|aborted)|network|early eof|rpc failed|"
+                       r"tls|ssl|remote end hung up|fetch origin|failed to connect|temporary failure|no laptop online|try again|rate limit|502|503|504", re.I)
 NUDGE_IDLE_S = 45.0          # a slow model thinks for a while: only remind an agent that has been silent AND commit-less for a few minutes
 NUDGE_QUIET_S = 180.0
 PROMPT_COOLDOWN_S = 5.0
@@ -294,10 +300,86 @@ class ProjectEngine:
     # ───────────── persistence / state out ─────────────
     def load(self) -> None:
         for d in self.hub.store.load_projects():
-            if d.get("status") in ("planning", "running"):
-                d["status"] = "paused"
-                d["note"] = "The Brain restarted; press Resume to continue."
+            if d.get("status") == "running":
+                d["status"], d["auto_resume"] = "paused", True
+                d["note"] = "The Brain restarted. Resuming automatically as the laptops reconnect."
+            elif d.get("status") == "planning":
+                d["status"] = "failed"
+                d["error"] = "The Brain restarted while the plan was being written. Choose a planner and plan again."
             self.items[d["id"]] = d
+
+    # ───────────── resilience ─────────────
+    def node_name(self, nid: str) -> str:
+        n = self.hub.nodes.get(nid)
+        return (n.member_name or n.name) if n else nid
+
+    def node_ok(self, nid: str) -> bool:
+        n = self.hub.nodes.get(nid)
+        return bool(n and n.online)
+
+    def node_gone(self, nid: str) -> None:
+        for p in self.items.values():
+            if p["status"] == "running" and any(m["node_id"] == nid for m in p["members"]):
+                self.log(p, "net", f"{self.node_name(nid)}'s laptop went offline. Their tasks wait and continue when it is back; nothing is lost.")
+
+    def node_back(self, nid: str) -> None:
+        for p in self.items.values():
+            if p["status"] in ("running", "paused") and any(m["node_id"] == nid for m in p["members"]):
+                self.log(p, "net", f"{self.node_name(nid)}'s laptop is back online.")
+                for t in p["tasks"]:
+                    if t["owner"] == nid:
+                        t["retry_at"], t["net_fail"], t["wait"] = 0, 0, ""
+
+    async def auto_resume(self) -> None:
+        """After a Brain restart: wait briefly for the laptops to reconnect, then continue every project that was running."""
+        await asyncio.sleep(1.0)
+        todo = [p for p in self.items.values() if p.get("auto_resume") and p["status"] == "paused"]
+        if not todo:
+            return
+        deadline = time.time() + 45.0
+        while time.time() < deadline and not all(self.node_ok(m["node_id"]) for p in todo for m in p["members"]):
+            await asyncio.sleep(1.0)
+        for p in todo:
+            if p["status"] == "paused" and p.get("auto_resume"):                  # not cancelled or resumed by hand meanwhile
+                p["auto_resume"] = False
+                self.log(p, "net", "Brain is back: resuming the project" + ("" if all(self.node_ok(m["node_id"]) for m in p["members"]) else " (some laptops are still offline; their tasks will wait)"))
+                self.start(p)
+
+    def net_wait(self, p: dict, t: dict, why: str) -> None:
+        """Record a transient problem: back off and retry. Only after NET_GRACE_S of continuous trouble is a human asked."""
+        now = time.time()
+        t["net_since"] = t.get("net_since") or now
+        t["net_fail"] = t.get("net_fail", 0) + 1
+        delay = NET_BACKOFF[min(t["net_fail"] - 1, len(NET_BACKOFF) - 1)]
+        t["retry_at"] = now + delay
+        t["wait"] = clip(why, 120)
+        if t["net_fail"] in (1, 5, 20):
+            self.log(p, "net", f"{t['id']}: {clip(why, 160)}. Retrying automatically (next in {delay}s).", t["id"])
+        if now - t["net_since"] > NET_GRACE_S and not any(c.get("task") == t["id"] and c["kind"] == "blocked" for c in p.get("cards", [])):
+            t["status"] = "blocked"
+            self.card(p, "blocked", f"Task {t['id']} ({t['title']}) has been unable to reach {self.node_name(t['owner'])}'s laptop or GitHub for {int((now - t['net_since']) / 60)} minutes: {clip(why, 200)}. Press Retry when the network is back.", task=t["id"])
+
+    def net_ok(self, t: dict) -> None:
+        if t.get("net_since") or t.get("net_fail"):
+            t["net_since"], t["net_fail"], t["retry_at"], t["wait"] = 0, 0, 0, ""
+
+    async def ensure_coordinator(self, p: dict) -> None:
+        """The coordinator laptop merges PRs and runs the tests. If it is offline, hand the role to another online teammate."""
+        cn = p.get("coordinator")
+        if self.node_ok(cn):
+            return
+        for _ in range(8):                                                        # a short blip is not worth a handover
+            await asyncio.sleep(2.0)
+            if self.node_ok(cn):
+                return
+        cand = [m for m in p["members"] if self.node_ok(m["node_id"]) and (p["forge"] == "local" or m.get("gh_user"))]
+        if not cand:
+            raise RuntimeError("no laptop online to coordinate merges")
+        new = cand[0]
+        self.log(p, "net", f"{self.node_name(cn)}'s laptop is offline: {new['name']}'s laptop now merges and verifies.")
+        await self.must(p, new["node_id"], "git_prepare", 180, dir=self.cdir(p), repo=p["repo"], base=p["base"], forge=p["forge"])
+        p["coordinator"] = new["node_id"]
+        self.save(p)
 
     def save(self, p: dict) -> None:
         self.hub.store.save_project(p["id"], p)
@@ -685,13 +767,16 @@ class ProjectEngine:
     async def run(self, p: dict) -> None:
         for t in p["tasks"]:
             if t["status"] == "starting":
-                t["status"] = "pending"
+                s0 = self.hub.sessions.get(t.get("sid", ""))
+                t["status"] = "running" if (s0 and s0.state == "live") else "pending"
+            if t["status"] == "review":
+                t["status"] = "running"                                        # an interrupted merge is simply attempted again
             if t["status"] == "running":
                 t["last_progress"] = time.time()
                 t["nudge_at"] = time.time()
         p["cards"] = [c for c in p.get("cards", []) if c["kind"] != "stalled"]
         if p["phase"] in ("plan", "bootstrap"):
-            await self.bootstrap(p)
+            await self.net_retry(p, "setup", lambda: self.bootstrap(p))
         while True:
             if p["phase"] == "build":
                 await self.build(p)
@@ -700,11 +785,11 @@ class ProjectEngine:
                 p["phase"] = "verify"
                 self.log(p, "phase", "all tasks merged: verifying the integrated project")
             if p["phase"] == "verify":
-                ok = await self.verify(p)
+                ok = await self.net_retry(p, "verification", lambda: self.verify(p))
                 if p["status"] != "running":
                     return
                 if ok:
-                    await self.finish(p)
+                    await self.net_retry(p, "final report", lambda: self.finish(p))
                     return
                 if p["round"] >= MAX_FIX_ROUNDS:
                     p["status"], p["phase"] = "failed", "done"
@@ -712,8 +797,38 @@ class ProjectEngine:
                     self.log(p, "error", p["error"])
                     await self.finish(p, failed=True)
                     return
-                await self.triage(p)
+                await self.net_retry(p, "triage", lambda: self.triage(p))
                 p["phase"] = "build"
+
+    async def check_agent(self, p: dict, m: dict) -> None:
+        """Fail early, with the fix spelled out, if a teammate's chosen agent is missing or not signed in (instead of a task that silently never starts)."""
+        n = self.hub.nodes.get(m["node_id"])
+        pr = next((x for x in (n.providers if n else []) if x.get("id") == m["provider"]), None)
+        label = (pr or {}).get("label", m["provider"])
+        if not pr or not pr.get("available"):
+            raise RuntimeError(f"{label} is not installed (or not on the PATH) on {m['name']}'s laptop. Install it there, then press Rescan on the Team page and resume.")
+        if pr.get("signed_in") is False:
+            raise RuntimeError(f"{label} is not signed in on {m['name']}'s laptop. Run it once there and sign in, then press Rescan on the Team page and resume.")
+
+    async def net_retry(self, p: dict, what: str, fn):
+        """Run a project-level step; a network problem (laptop offline, GitHub unreachable) is retried with backoff instead of failing the project."""
+        start, n = time.time(), 0
+        while True:
+            try:
+                return await fn()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                msg = f"{type(e).__name__}: {e}"
+                if not TRANSIENT.search(msg) or time.time() - start > NET_GRACE_S or p["status"] not in ("running", "paused"):
+                    raise
+                delay = NET_BACKOFF[min(n, len(NET_BACKOFF) - 1)]
+                n += 1
+                if n in (1, 5, 20):
+                    self.log(p, "net", f"{what}: {clip(msg, 160)}. Retrying automatically (next in {delay}s).")
+                await asyncio.sleep(delay)
+                while p["status"] == "paused":
+                    await asyncio.sleep(1.0)
 
     async def bootstrap(self, p: dict) -> None:
         p["phase"] = "bootstrap"
@@ -729,6 +844,7 @@ class ProjectEngine:
                 raise RuntimeError(f"the GitHub CLI is not logged in on {m['name']}'s laptop (run `gh auth login` there)")
             if not r.get("git_email"):
                 self.log(p, "warn", f"{m['name']}: no git user.email configured; commits may not be attributed")
+            await self.check_agent(p, m)
         coord = next((m for m in p["members"] if pre[m["node_id"]].get("gh") or p["forge"] == "local"), p["members"][0])
         p["coordinator"] = coord["node_id"]
         cn = coord["node_id"]
@@ -770,7 +886,7 @@ class ProjectEngine:
             merged = {t["id"] for t in p["tasks"] if t["status"] == "merged"}
             busy = {t["owner"] for t in p["tasks"] if t["status"] in ("running", "review", "starting")}
             for t in sorted(pend, key=lambda x: (-x["weight"], x["id"])):
-                if t["status"] == "pending" and t["owner"] not in busy and all(d in merged for d in t["depends_on"]):
+                if t["status"] == "pending" and t["owner"] not in busy and all(d in merged for d in t["depends_on"]) and time.time() >= t.get("retry_at", 0) and self.node_ok(t["owner"]):
                     busy.add(t["owner"])
                     t["status"] = "starting"
                     asyncio.create_task(self._safe(p, t, self.start_task(p, t)))
@@ -783,11 +899,19 @@ class ProjectEngine:
     async def _safe(self, p: dict, t: dict, coro) -> None:
         try:
             await coro
+            self.net_ok(t)
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            t["attempts"] = t.get("attempts", 0) + 1
             msg = f"{type(e).__name__}: {e}"
+            if t["status"] == "review":
+                t["status"] = "running"                                        # never leave a task stuck in "merging" after a failure
+            if TRANSIENT.search(msg) or not self.node_ok(t["owner"]):
+                if t["status"] == "starting":
+                    t["status"] = "pending" if not t.get("sid") else "running"
+                self.net_wait(p, t, msg if TRANSIENT.search(msg) else f"{self.node_name(t['owner'])}'s laptop is offline")
+                return
+            t["attempts"] = t.get("attempts", 0) + 1
             self.log(p, "error", f"{t['id']}: {clip(msg, 300)}", t["id"])
             if t["attempts"] >= 3:
                 t["status"] = "blocked"
@@ -804,8 +928,12 @@ class ProjectEngine:
         await self.must(p, nid, "git_prepare", 180, dir=d, repo=p["repo"], base=p["base"], branch=branch, forge=p["forge"], resume=bool(t.get("attempts") or t.get("restarts")))
         await self.must(p, nid, "write_task", 30, dir=d, fname="TASK.md", content=render_task(p, t, branch, p.get("contract_paths", [])))
         from hub.apiprofiles import project_args
+        old = self.hub.sessions.get(t.get("sid", ""))
+        if old and old.state in ("live", "starting"):
+            await self.hub.stop_session(old.sid, "orchestrator")                       # never two agents in one working folder
+            await asyncio.sleep(1.0)
         sid = await self.hub.start_session(nid, m["provider"], d, "orchestrator", profile_id=m.get("profile_id", ""), model=m.get("model", ""),
-                                           extra_args=project_args(m["provider"], p["permissions"] in ("auto", "turbo"), p["permissions"] == "turbo"))
+                                           extra_args=project_args(m["provider"], p["permissions"] in ("auto", "turbo"), p["permissions"] == "turbo", resume=bool(t.get("restarts"))))
         if not sid:
             raise RuntimeError(f"could not start {m['provider']} on {m['name']}'s laptop")
         t["sid"] = sid
@@ -911,9 +1039,18 @@ class ProjectEngine:
     async def tick_task(self, p: dict, t: dict) -> None:
         if t["status"] == "review":
             return
+        if time.time() < t.get("retry_at", 0):
+            return
         m = self.member(p, t["owner"])
         nid, d = m["node_id"], self.mdir(p, m)
         s = self.hub.sessions.get(t["sid"])
+        node = self.hub.nodes.get(nid)
+        if not node or not node.online:                                       # laptop offline: its session keeps running locally; wait, do not restart
+            self.net_wait(p, t, f"{m['name']}'s laptop is offline")
+            return
+        if s and s.state == "offline" and time.time() - node.connected_at < REATTACH_S:
+            return                                                            # just reconnected: the session list is still being re-announced
+        self.net_ok(t)
         dead = (not s) or s.state in ("exited", "error", "offline")
         if s and not dead:
             fr = self.fresh(s, t.get("prompt_mark", 0), 1200)
@@ -934,19 +1071,17 @@ class ProjectEngine:
                 await self.supervise(p, t, s, self.screen(s, 1800), "the agent has printed nothing for 30s and made no commit for a minute")
         gs = await self.op(nid, "git_status", 60, dir=d, base=p["base"], branch=t["branch"])
         if not gs.get("ok"):
-            if dead:
-                raise RuntimeError("session ended and the laptop is unreachable: " + gs.get("err", ""))
-            return
+            raise RuntimeError("laptop unreachable: " + gs.get("err", ""))                     # transient: _safe backs off and retries
         t["commits"], t["added"], t["removed"] = gs["ahead"], gs["added"], gs["removed"]
         t["changed"] = gs["changed"][:40]
         if gs["head"] != t.get("last_head"):
             t["last_head"], t["last_progress"] = gs["head"], time.time()
         idle = time.time() - s.last_out if s and not dead else 999
-        marker = bool(s and not dead and DONE_MARK.search(self.screen(s, 2500)))
+        marker = bool(s and DONE_MARK.search(self.screen(s, 2500)))
         enough = gs["ahead"] >= t["min_commits"] or (marker and gs["ahead"] >= 1)
         finished = enough and (idle >= IDLE_DONE_S or (marker and idle >= MARKER_IDLE_S)) and (gs["pushed"] or idle >= IDLE_DONE_S * 2)
-        if dead and gs["ahead"] >= 1:
-            finished = True
+        if dead and gs["ahead"] >= 1 and t.get("restarts", 0) >= 2:
+            finished = True                                                   # restarted twice and still short of the target: merge what exists, verification decides
         if finished or (dead and gs["ahead"] == 0 and t.get("restarts", 0) >= 2):
             if gs["ahead"] == 0:
                 raise RuntimeError("the agent exited without making any commit")
@@ -1007,6 +1142,7 @@ class ProjectEngine:
                              body=f"{t['description']}\n\nOwner: {m['name']}\nCommits: {gs['ahead']}\nManaged by K.O.D.E.")
         t["pr_url"], t["pr_number"] = pr["url"], pr.get("number", 0)
         self.log(p, "pr", f"{t['id']}: pull request opened {pr['url']}", t["id"])
+        await self.ensure_coordinator(p)
         async with self.locks.setdefault(p["id"], asyncio.Lock()):
             # authoritative check on the shared remote just before merging: late pushes from the agent cannot slip a violation in
             bf = await self.must(p, p["coordinator"], "branch_files", 90, dir=self.cdir(p), base=p["base"], branch=t["branch"])
@@ -1050,6 +1186,7 @@ class ProjectEngine:
 
     # ───────────── verify / fix / finish ─────────────
     async def verify(self, p: dict) -> bool:
+        await self.ensure_coordinator(p)
         cn, d = p["coordinator"], self.cdir(p)
         await self.must(p, cn, "git_prepare", 180, dir=d, repo=p["repo"], base=p["base"], forge=p["forge"])
         results = []

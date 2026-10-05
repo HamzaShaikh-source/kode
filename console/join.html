@@ -35,7 +35,8 @@
         </div>
         <p class="jhint" id="cmd-hint">Open <b>PowerShell</b> and paste:</p>
         <pre class="cmd" id="cmd"></pre>
-        <div class="jrow"><button class="btn primary" type="button" id="copy">Copy command</button> <a class="btn" id="view" target="_blank" rel="noopener">Read the script first</a></div>
+        <div class="jrow"><a class="btn primary" id="dl" download="kode-join.ps1">Download installer</a> <button class="btn" type="button" id="copy">Copy command</button> <a class="btn" id="view" target="_blank" rel="noopener">Read the script first</a></div>
+        <p class="jhint" id="win-note" hidden>On Windows we use a downloaded file instead of a one-line download-and-run command, because Windows Defender blocks that pattern. If your browser warns about the file, choose Keep. It is plain text you can read first.</p>
         <p class="jhint">It installs a small agent into <code>kode-node</code> in your home folder, checks your tools, and connects to your team. Keep the window open while you work.</p>
       </li>
       <li><b>Done</b> when this page says you are connected.</li>

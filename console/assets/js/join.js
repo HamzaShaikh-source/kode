@@ -5,16 +5,20 @@ const enc = encodeURIComponent(code);
 let os = /Windows/i.test(navigator.userAgent) ? 'win' : /Mac/i.test(navigator.userAgent) ? 'mac' : 'linux';
 let brain = location.origin;
 
+const WIN_FILE = 'powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\\Downloads\\kode-join.ps1"';
 function command() {
-  if (os === 'win') return `powershell -ExecutionPolicy Bypass -NoProfile -Command "irm ${brain}/join/${enc}/install.ps1 | iex"`;
+  if (os === 'win') return WIN_FILE;
   return `curl -fsSL ${brain}/join/${enc}/install.sh | sh`;
 }
 function paint() {
   for (const b of document.querySelectorAll('[data-os]')) b.setAttribute('aria-selected', String(b.dataset.os === os));
   $('#cmd').textContent = command();
   $('#cmd-hint').innerHTML = '';
-  $('#cmd-hint').append(...(os === 'win' ? ['Open ', bold('PowerShell'), ' and paste:'] : ['Open ', bold('Terminal'), ' and paste:']));
+  $('#cmd-hint').append(...(os === 'win' ? ['First press ', bold('Download installer'), ', then open ', bold('PowerShell'), ' and paste:'] : ['Open ', bold('Terminal'), ' and paste:']));
   $('#view').href = `/join/${enc}/install.${os === 'win' ? 'ps1' : 'sh'}`;
+  $('#dl').hidden = os !== 'win';
+  $('#dl').href = `/join/${enc}/install.ps1?dl=1`;
+  $('#win-note').hidden = os !== 'win';
 }
 const bold = (t) => { const b = document.createElement('b'); b.textContent = t; return b; };
 

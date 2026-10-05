@@ -51,6 +51,8 @@ def test_join_api_installers_and_lockout(tmp_path):
             sh = httpx.get(f"{hub.base}/join/{code}/install.sh").text
             for script in (ps1, sh):
                 assert hub.base in script and code in script and hub.lead_key not in script
+            dl = httpx.get(f"{hub.base}/join/{code}/install.ps1?dl=1")                           # the Windows "Download installer" button
+            assert dl.headers["content-disposition"].startswith("attachment") and dl.content[:3] == bytes([239, 187, 191]) and b"\r\n" in dl.content
             assert httpx.get(f"{hub.base}/join/{code}").status_code == 200                  # the page itself
             assert "Content-Security-Policy" in httpx.get(f"{hub.base}/join/{code}").headers
             # unknown / malformed codes are authentication failures, and repeated ones lock the address out
