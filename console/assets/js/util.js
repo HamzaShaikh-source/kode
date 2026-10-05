@@ -108,6 +108,7 @@ export const PROVIDERS = {
   opencode: { name: 'OpenCode', color: '#4b6a88', letter: 'O' },
   hermes: { name: 'Hermes', color: '#9a7316', letter: 'H' },
   agy: { name: 'Antigravity', color: '#3a6ea5', letter: 'A' },
+  commandcode: { name: 'Command Code', color: '#0f766e', letter: 'K' },
   shell: { name: 'Shell', color: '#6b675d', letter: '>' },
 };
 export const providerMeta = (id, label) => ({ ...(PROVIDERS[id] || { name: label || id, color: '#6b675d', letter: (label || id || '?')[0].toUpperCase() }), name: label || (PROVIDERS[id] || {}).name || id });

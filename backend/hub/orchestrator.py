@@ -128,6 +128,11 @@ class Orchestrator:
         if autonomy in AUTONOMY:
             self.autonomy = autonomy
         if profile_id is not None:
+            if profile_id.startswith("cli:"):                       # "cli:<provider>:<node id>": a teammate's own Claude Code / Codex login, no API key
+                _, _, rest = profile_id.partition(":")
+                prov, _, nid = rest.partition(":")
+                if prov not in ("claude", "codex") or nid not in self.hub.nodes:
+                    return
             self.profile_id = profile_id
         if model is not None:
             self.model = model
@@ -171,6 +176,11 @@ class Orchestrator:
     def _client(self):
         if self.llm_override is not None:
             return self.llm_override
+        if self.profile_id.startswith("cli:"):
+            from hub.project import CliClient
+            _, _, rest = self.profile_id.partition(":")
+            prov, _, nid = rest.partition(":")
+            return RetryingLLM(CliClient(self.hub.projects, prov, nid), max_tries=2, base_delay_s=1.0, deadline_s=600)
         if self.profile_id:
             prof = self.hub.store.get_profile(self.profile_id, with_key=True)
             if not prof:

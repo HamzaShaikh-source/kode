@@ -62,10 +62,11 @@ export function mount(root) {
     stop.hidden = !busy; send.hidden = busy ? false : false; send.disabled = busy; input.disabled = false;
     for (const b of autoSeg.children) b.setAttribute('aria-pressed', String(b.dataset.k === o.autonomy));
     setText(autoHelp, (AUTONOMY.find((a) => a[0] === o.autonomy) || [])[2] || '');
-    const sig = o.profile_id + '|' + S.profiles.map((p) => p.id).join(',');
+    const sig = o.profile_id + '|' + S.profiles.map((p) => p.id).join(',') + '|' + S.nodes.map((n) => n.id + n.online).join(',');
     if (prof._sig !== sig) {
       prof._sig = sig;
-      clear(prof).append(h('option', { value: '' }, 'Hub default' + (o.default_label ? ` (${o.default_label})` : '')), ...S.profiles.map((p) => h('option', { value: p.id }, p.name)));
+      const clis = S.nodes.filter((n) => n.online).flatMap((n) => ['claude', 'codex'].filter((id) => (n.providers || []).some((p) => p.id === id && p.available && p.signed_in !== false)).map((id) => h('option', { value: `cli:${id}:${n.id}` }, `${id === 'claude' ? 'Claude Code' : 'Codex'} on ${n.member_name || n.name} (own login)`)));
+      clear(prof).append(h('option', { value: '' }, 'Hub default' + (o.default_label ? ` (${o.default_label})` : '')), ...clis, ...S.profiles.map((p) => h('option', { value: p.id }, 'API profile: ' + p.name)));
       prof.value = o.profile_id || '';
     }
     const cur = S.profiles.find((p) => p.id === prof.value);

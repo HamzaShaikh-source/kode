@@ -30,7 +30,7 @@ LIVE_CMD = "for /l %i in (1,1,400) do @(echo build step %i of 400 ... ok & ping 
 
 
 def git_workspace(name: str) -> Path:
-    ws = BACKEND / "demo_workspaces" / "".join(c for c in name.split("'")[0].lower() if c.isalnum())
+    ws = Path.home() / "kode-demo-workspaces" / "".join(c for c in name.split("'")[0].lower() if c.isalnum())      # outside the K.O.D.E repo: an agent that strays cannot touch it
     if not (ws / ".git").exists():
         ws.mkdir(parents=True, exist_ok=True)
         run = lambda *a: subprocess.run(["git", "-C", str(ws), *a], capture_output=True)

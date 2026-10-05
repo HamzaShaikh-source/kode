@@ -137,9 +137,43 @@ def extract_json(text: str) -> dict:
             raise LLMOutputError("no JSON object in model output")
         t = t[a:b + 1]
     try:
-        return json.loads(t)
-    except json.JSONDecodeError as e:
-        raise LLMOutputError(f"invalid JSON from model: {e}") from e
+        return json.loads(t, strict=False)                 # strict=False accepts raw newlines/tabs inside strings, a common model slip
+    except json.JSONDecodeError as first:
+        try:
+            return json.loads(_repair_json(t), strict=False)
+        except json.JSONDecodeError:
+            raise LLMOutputError(f"invalid JSON from model: {first}") from first
+
+
+def _repair_json(t: str) -> str:
+    """Cheap local repair (no model call): escape raw control characters inside strings and drop trailing commas."""
+    out, in_str, esc = [], False, False
+    for ch in t:
+        if in_str:
+            if esc:
+                out.append(ch)
+                esc = False
+            elif ch == chr(92):
+                out.append(ch)
+                esc = True
+            elif ch == '"':
+                out.append(ch)
+                in_str = False
+            elif ch == chr(10):
+                out.append(chr(92) + "n")
+            elif ch == chr(13):
+                out.append(chr(92) + "r")
+            elif ch == chr(9):
+                out.append(chr(92) + "t")
+            elif ord(ch) < 32:
+                out.append(" ")
+            else:
+                out.append(ch)
+        else:
+            if ch == '"':
+                in_str = True
+            out.append(ch)
+    return re.sub(r",(\s*[}\]])", r"\1", "".join(out))
 
 
 async def complete_model(llm: LLMClient, system: str, user: str, model_cls: Type[T], *,

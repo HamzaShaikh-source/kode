@@ -162,3 +162,12 @@ Windows Defender finding: the one-liner `powershell -ExecutionPolicy Bypass -Com
 - One agent session per teammate is reused across that teammate's tasks (at most 4, then a fresh one; a retried or restarted task always gets a fresh agent). Done markers only count output printed since the task started.
 - `run_kode.py` joins the lead's own PC as a teammate by default (`--no-lead-node` to disable); the lead PC coordinates merges, so contract, plan and final commits are the lead's, and it receives tasks like everyone else.
 - Relevant installed skills (from `~/.claude/skills`, `~/.agents/skills`, `~/.codex/skills`) are listed in each task for the agent to use.
+
+## Stuck tasks, backups, review loop, context, limits (this round)
+
+- Retry / Skip / Switch agent / Ask the planner now work on stuck cards and on every running task card. The planner decides stuck tasks (`decide_stuck`, at most 3 per task, only after a long silence); `pick_owner` chooses owners from first-time-right rate, speed and load, with past hackathons as the prior. All covered by `tests/test_p3.py`.
+- Reminders are never typed into a busy agent or stacked in its input box, and name the task and branch (a shared session once received another task's reminder). Verified with scripted agents only; behaviour in real Claude Code, Codex and Antigravity sessions is unverified.
+- Usage limit / API-error screens trigger a failover to a backup agent (Command Code first by default) on the same branch, then to another teammate. The screen patterns are heuristics.
+- Agent limits: Codex's real rate-limit windows and Claude Code token totals are read from the agents' own logs (`op_limits`, unit-tested with fake logs and run against this PC). Antigravity exposes nothing local. No percentage is shown for Claude Code because it records none.
+- Review loop (approve / request changes -> planner tasks -> verify, polish, judge again), hand-off file, session list, presets, memory ("Hackathon complete") are integration-tested with scripted agents in `test_project_loop...`. Screenshots of the running app are NOT taken; the report says so.
+- Context attachments (files, links with a private-address guard, notes) and clarifying questions are unit-tested; the planner keeps one Claude conversation per project (`--session-id` / `--resume`), unverified against a live Claude run.

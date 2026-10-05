@@ -9,8 +9,10 @@ The idea with the most votes wins; ties go to the higher mean score, then to the
 """
 import asyncio
 import statistics
+import time
 from typing import Any, Dict, List, Optional
 
+from hub import context as cx
 from hub.judge import shuffle_seeded
 from llm import extract_json
 
@@ -39,13 +41,24 @@ think this team should build to win. {mine}Vote for the best idea for the proble
 Reply with ONLY a JSON object: {"scores": [{"id": "I1", "score": 7}], "vote": "I2", "reason": "one or two sentences"}"""
 
 
-async def _ask(client: Any, system: str, user: str, timeout: float = 600.0) -> Optional[dict]:
+async def _ask(client: Any, system: str, user: str, timeout: float = 600.0, track: Optional[tuple] = None) -> Optional[dict]:
+    """One agent's answer, or None. `track` = (engine, project, member, round) keeps the live panel honest: who is thinking, who is done, how long it took."""
+    t0 = time.time()
+    if track:
+        eng, p, m, n = track
+        p.setdefault("live_agents", {})[m["name"]] = {"agent": m["provider"], "round": n, "state": "working", "since": t0, "took": 0}
+        eng.save(p)
+    obj = None
     try:
         res = await asyncio.wait_for(client.complete(system, user + "\n\nReply with the JSON object only.", max_tokens=4000), timeout)
-        obj = extract_json(res.text)
-        return obj if isinstance(obj, dict) else None
+        o = extract_json(res.text)
+        obj = o if isinstance(o, dict) else None
     except Exception:
-        return None
+        obj = None
+    if track:
+        p["live_agents"][m["name"]].update(state="done" if obj else "failed", took=round(time.time() - t0))
+        eng.save(p)
+    return obj
 
 
 def _s(v: Any, n: int) -> str:
@@ -86,14 +99,23 @@ async def run(eng: Any, p: dict) -> None:
     ide: Dict[str, Any] = {"problem": problem, "rounds": [], "ideas": [], "reviews": [], "votes": [], "winner": "", "ranking": []}
     p["ideation"] = ide
     p["problem"] = problem
+    p["live_agents"] = {}
     p["status"], p["phase"], p["note"] = "planning", "ideate", "Hackathon mode: the agents are researching and proposing ideas..."
     eng.save(p)
 
+    def rnd(i: int, text: str) -> None:
+        ide["round_now"] = i
+        p["note"] = f"Round {i} of 4: {text}"
+        eng.step(p, "ideate", "working", f"Round {i} of 4: {text}")
+        log(f"round {i} of 4: {text}")
+
     # 1 ── research and propose
+    rnd(1, f"{n} agents research the problem and propose ideas")
     ctx = f"PROBLEM STATEMENT:\n{problem}\n\nTEAM: {n} developers with these agents: " + ", ".join(sorted({m['provider'] for m in members})) + "\n"
+    if cx.summary(p, 5000):
+        ctx += "\nATTACHED COMPETITION CONTEXT (rules, judging criteria, links, documents):\n" + cx.summary(p, 5000) + "\n"
     k = 2 if n <= 3 else 1
-    log(f"round 1 of 4: {n} agents research the problem and propose ideas")
-    props = await asyncio.gather(*(_ask(c, PROPOSE.replace("{n}", str(n)).replace("{k}", str(k)), ctx) for _, c in clients))
+    props = await asyncio.gather(*(_ask(c, PROPOSE.replace("{n}", str(n)).replace("{k}", str(k)), ctx, track=(eng, p, m, 1)) for m, c in clients))
     raw = []
     for (m, _), obj in zip(clients, props):
         for it in ((obj or {}).get("ideas") or [])[:k]:
@@ -119,8 +141,8 @@ async def run(eng: Any, p: dict) -> None:
         log("only one idea was proposed: it is the winner by default")
     else:
         # 2 ── critique
-        log("round 2 of 4: anonymous critique and scoring")
-        revs = await asyncio.gather(*(_ask(c, CRITIQUE.replace("{rubric}", RUBRIC).replace("{mine}", "Your own ideas are " + ", ".join(i["id"] for i in ideas if i["node_id"] == m["node_id"]) + " (do not review those). " if any(i["node_id"] == m["node_id"] for i in ideas) else ""), "PROBLEM:\n" + problem + "\n\nIDEAS:\n" + board()) for m, c in clients))
+        rnd(2, "agents critique and score each other's ideas, anonymously")
+        revs = await asyncio.gather(*(_ask(c, CRITIQUE.replace("{rubric}", RUBRIC).replace("{mine}", "Your own ideas are " + ", ".join(i["id"] for i in ideas if i["node_id"] == m["node_id"]) + " (do not review those). " if any(i["node_id"] == m["node_id"] for i in ideas) else ""), "PROBLEM:\n" + problem + "\n\nIDEAS:\n" + board(), track=(eng, p, m, 2)) for m, c in clients))
         reviews: List[dict] = []
         for (m, _), obj in zip(clients, revs):
             for r in ((obj or {}).get("reviews") or []):
@@ -131,7 +153,7 @@ async def run(eng: Any, p: dict) -> None:
         log(f"{len(reviews)} reviews written")
         eng.save(p)
         # 3 ── rebuttal
-        log("round 3 of 4: authors answer the critique and improve their ideas")
+        rnd(3, "authors answer the critique and improve their ideas")
 
         def crit_for(iid: str) -> str:
             return "\n".join(f"- strengths: {r['strengths']} | weaknesses: {r['weaknesses']}" for r in reviews if r["id"] == iid) or "(no reviews)"
@@ -139,7 +161,7 @@ async def run(eng: Any, p: dict) -> None:
         for m, c in clients:
             mine = [i for i in ideas if i["node_id"] == m["node_id"]]
             if mine:
-                tasks.append((m, mine, _ask(c, REBUT, "PROBLEM:\n" + problem + "\n\nYOUR IDEAS AND THEIR REVIEWS:\n" + "\n\n".join(f"{i['id']}: {i['title']}\nPitch: {i['pitch']}\nMVP: {i['mvp']}\nREVIEWS:\n{crit_for(i['id'])}" for i in mine))))
+                tasks.append((m, mine, _ask(c, REBUT, "PROBLEM:\n" + problem + "\n\nYOUR IDEAS AND THEIR REVIEWS:\n" + "\n\n".join(f"{i['id']}: {i['title']}\nPitch: {i['pitch']}\nMVP: {i['mvp']}\nREVIEWS:\n{crit_for(i['id'])}" for i in mine), track=(eng, p, m, 3))))
         outs = await asyncio.gather(*(t[2] for t in tasks))
         for (m, mine, _), obj in zip(tasks, outs):
             for rv in ((obj or {}).get("revisions") or []):
@@ -159,9 +181,9 @@ async def run(eng: Any, p: dict) -> None:
         log(f"{len(live)} ideas remain after the rebuttal")
         eng.save(p)
         # 4 ── vote
-        log("round 4 of 4: every agent votes (never for its own idea)")
+        rnd(4, "every agent votes, never for its own idea")
         summary = "\n\n".join(f"{i['id']}: {i['title']}\nPitch: {i['pitch']}\nMVP: {i['mvp']}\nAuthor's answer to critique: {i.get('response', '-')}\nReviews:\n{crit_for(i['id'])}" for i in live)
-        votes_raw = await asyncio.gather(*(_ask(c, VOTE.replace("{mine}", ("Your own ideas are " + ", ".join(i["id"] for i in live if i["node_id"] == m["node_id"]) + ": you may not vote for them. ") if any(i["node_id"] == m["node_id"] for i in live) else ""), "PROBLEM:\n" + problem + "\n\nSURVIVING IDEAS:\n" + summary) for m, c in clients))
+        votes_raw = await asyncio.gather(*(_ask(c, VOTE.replace("{mine}", ("Your own ideas are " + ", ".join(i["id"] for i in live if i["node_id"] == m["node_id"]) + ": you may not vote for them. ") if any(i["node_id"] == m["node_id"] for i in live) else ""), "PROBLEM:\n" + problem + "\n\nSURVIVING IDEAS:\n" + summary, track=(eng, p, m, 4)) for m, c in clients))
         votes: Dict[str, str] = {}
         vscores: Dict[str, List[float]] = {}
         for (m, _), obj in zip(clients, votes_raw):

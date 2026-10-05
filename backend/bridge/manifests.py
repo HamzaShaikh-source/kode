@@ -123,6 +123,10 @@ def signed_in(m: "Manifest") -> Optional[bool]:
         r = _run_quiet([exe, "login", "status"])
         if r is not None:
             res = r.returncode == 0 and "logged in" in (r.stdout + r.stderr).lower()
+    elif m.id == "commandcode":
+        r = _run_quiet([exe, "status"])
+        if r is not None:
+            res = "authenticated" in re.sub(r"\x1b\[[0-9;]*m", "", r.stdout + r.stderr).lower() and "not authenticated" not in (r.stdout + r.stderr).lower()
     _AUTH_CACHE[m.id] = (time.time(), res)
     return res
 

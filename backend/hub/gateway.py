@@ -539,6 +539,33 @@ class Hub:
             return True
         return False
 
+    def notice(self, level: str, text: str, project: str = "") -> None:
+        """A message for the lead's console (toast, desktop notification) and, if configured, a webhook. Never raises."""
+        try:
+            self._notices = (getattr(self, "_notices", []) + [{"id": secrets.token_hex(3), "ts": int(time.time() * 1000), "level": level, "text": text[:400], "project": project}])[-60:]
+            self.event("notice", text[:200], "", "", "orchestrator", audit=False)
+            asyncio.get_event_loop().create_task(self.broadcast_notices())
+            url = self.store.get_setting("notify.webhook")
+            if url:
+                asyncio.get_event_loop().create_task(self._webhook(url, level, text))
+        except Exception:
+            pass
+
+    async def broadcast_notices(self) -> None:
+        for v in list(self.viewers):
+            if v.role == ROLE_LEAD:
+                await v.send(t="notices", items=getattr(self, "_notices", [])[-20:])
+
+    async def _webhook(self, url: str, level: str, text: str) -> None:
+        if not url.startswith("https://"):
+            return
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=8) as c:
+                await c.post(url, json={"content": text, "text": text, "level": level})
+        except Exception:
+            pass
+
     def push_projects(self) -> None:
         if self._proj_task is None or self._proj_task.done():
             self._proj_task = asyncio.create_task(self._flush_projects())
@@ -784,6 +811,43 @@ class Hub:
                 self.store.set_setting("team_url", url)
                 self.event("config", f"team URL set to {url or '(automatic)'}", actor=ROLE_LEAD)
                 await v.send(t="result", ref=m.get("ref"), ok=True, **self.net_info())
+        elif t == "limits_refresh" and lead:
+            async def one(n):
+                r = await self.node_op(n.id, "limits", 40)
+                if r.get("ok"):
+                    n.info = {**(n.info or {}), "limits": {k: val for k, val in r.items() if k != "ok"}}
+            await asyncio.gather(*(one(n) for n in list(self.nodes.values()) if n.online))
+            self.mark_dirty()
+            await v.send(t="result", ref=m.get("ref"), ok=True)
+        elif t == "settings_get" and lead:
+            keys = ("proj.max_fix_rounds", "proj.polish_rounds", "proj.judge_pass", "proj.reuse", "proj.stall_min", "proj.default_permissions", "proj.default_review", "proj.default_backup", "proj.default_questions", "notify.webhook", "notify.desktop", "notify.sound")
+            await v.send(t="result", ref=m.get("ref"), ok=True, values={k: self.store.get_setting(k) for k in keys})
+        elif t == "settings_set" and lead:
+            rules = {"proj.max_fix_rounds": (0, 8), "proj.polish_rounds": (0, 4), "proj.judge_pass": (0, 100), "proj.reuse": (1, 12), "proj.stall_min": (3, 60)}
+            k, val = str(m.get("key", "")), str(m.get("value", "")).strip()
+            if k in rules:
+                try:
+                    num = float(val)
+                    if not rules[k][0] <= num <= rules[k][1]:
+                        raise ValueError
+                except ValueError:
+                    await v.send(t="result", ref=m.get("ref"), ok=False, err=f"{k} must be a number between {rules[k][0]} and {rules[k][1]}")
+                    return
+            elif k == "proj.default_permissions" and val not in ("turbo", "auto", "ask", ""):
+                await v.send(t="result", ref=m.get("ref"), ok=False, err="permissions must be turbo, auto or ask")
+                return
+            elif k == "proj.default_review" and val not in ("human", "auto", ""):
+                await v.send(t="result", ref=m.get("ref"), ok=False, err="review must be human or auto")
+                return
+            elif k == "notify.webhook" and val and not val.startswith("https://"):
+                await v.send(t="result", ref=m.get("ref"), ok=False, err="the webhook must be an https:// URL")
+                return
+            elif k not in ("proj.default_backup", "proj.default_questions", "notify.webhook", "notify.desktop", "notify.sound", "proj.default_permissions", "proj.default_review"):
+                await v.send(t="result", ref=m.get("ref"), ok=False, err="unknown setting")
+                return
+            self.store.set_setting(k, val[:300])
+            self.event("config", f"setting {k} changed", actor=ROLE_LEAD)
+            await v.send(t="result", ref=m.get("ref"), ok=True)
         elif t == "rescan_node" and lead and m.get("node") in self.nodes:
             await self._send_node(m["node"], t="rescan")
             await v.send(t="result", ref=m.get("ref"), ok=True)

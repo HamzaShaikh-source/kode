@@ -18,6 +18,7 @@ import * as home from './views/member.js';
 import * as models from './views/models.js';
 import * as orchestrator from './views/orchestrator.js';
 import * as projects from './views/projects.js';
+import { init as initNotify } from './notify.js';
 
 const VIEWS = { brain, sessions, session, machines, team: machines, models, orchestrator, projects, usage, activity, settings, home };
 const LEAD_NAV = [['brain', 'Brain', 'brain'], ['projects', 'Projects', 'branch'], ['orchestrator', 'Orchestrator', 'bolt'], ['sessions', 'Sessions', 'grid'], ['team', 'Team', 'user'], ['models', 'Models', 'key'], ['usage', 'Usage', 'chart'], ['activity', 'Activity', 'pulse'], ['settings', 'Settings', 'sliders']];
@@ -158,7 +159,8 @@ function paint() {
   if (cur.update) cur.update();
 }
 
-buildSide(); buildTop(); shortcuts.init(); initPalette();
+buildSide(); buildTop(); shortcuts.init(); initNotify();
+  initPalette();
 window.addEventListener('hashchange', go);
 subscribe(() => { go(); paint(); });
 window.__kode = { S, hub, pool, openAddMachine, openNewSession };

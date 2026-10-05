@@ -15,6 +15,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -63,6 +64,93 @@ def scan_skills(limit: int = 120) -> List[Dict[str, str]]:
             out.append({"name": d.name, "description": desc})
             if len(out) >= limit:
                 return out
+    return out
+
+
+def _iter_jsonl(path: Path, tail_bytes: int = 0):
+    try:
+        with open(path, "rb") as f:
+            if tail_bytes:
+                f.seek(0, 2)
+                size = f.tell()
+                f.seek(max(0, size - tail_bytes))
+                f.readline() if size > tail_bytes else None
+            for raw in f:
+                try:
+                    yield json.loads(raw)
+                except ValueError:
+                    continue
+    except OSError:
+        return
+
+
+def _find(obj, key):
+    if isinstance(obj, dict):
+        if key in obj and obj[key]:
+            return obj[key]
+        for v in obj.values():
+            r = _find(v, key)
+            if r:
+                return r
+    elif isinstance(obj, list):
+        for v in obj:
+            r = _find(v, key)
+            if r:
+                return r
+    return None
+
+
+def scan_limits() -> Dict[str, Any]:
+    import datetime
+    out: Dict[str, Any] = {"ts": int(time.time())}
+    home = Path.home()
+    # Codex: the newest rollout file carries the latest rate_limits block
+    root = home / ".codex" / "sessions"
+    try:
+        files = sorted(root.rglob("rollout-*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)[:3] if root.is_dir() else []
+    except OSError:
+        files = []
+    for f in files:
+        rl = None
+        for obj in _iter_jsonl(f, tail_bytes=400_000):
+            r = _find(obj, "rate_limits")
+            if r:
+                rl = r
+        if rl:
+            def win(w):
+                return {"used_percent": w.get("used_percent"), "window_minutes": w.get("window_minutes"), "resets_at": w.get("resets_at")} if isinstance(w, dict) else None
+            out["codex"] = {"primary": win(rl.get("primary")), "secondary": win(rl.get("secondary")), "plan": rl.get("plan_type"), "reached": rl.get("rate_limit_reached_type"), "as_of": int(f.stat().st_mtime)}
+            break
+    # Claude Code: tokens in rolling windows from its session logs
+    root = home / ".claude" / "projects"
+    now = time.time()
+    t5, t7, msgs5 = {"in": 0, "out": 0, "cache": 0}, {"in": 0, "out": 0, "cache": 0}, 0
+    try:
+        recent = [p for p in root.rglob("*.jsonl") if p.stat().st_mtime > now - 7 * 86400] if root.is_dir() else []
+    except OSError:
+        recent = []
+    for f in sorted(recent, key=lambda p: p.stat().st_mtime, reverse=True)[:300]:
+        for obj in _iter_jsonl(f):
+            u = (obj.get("message") or {}).get("usage") if isinstance(obj.get("message"), dict) else None
+            if not u:
+                continue
+            try:
+                ts = datetime.datetime.fromisoformat(str(obj.get("timestamp", "")).replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                continue
+            age = now - ts
+            if age > 7 * 86400:
+                continue
+            vals = (int(u.get("input_tokens") or 0), int(u.get("output_tokens") or 0), int(u.get("cache_creation_input_tokens") or 0) + int(u.get("cache_read_input_tokens") or 0))
+            for bucket in ([t7] + ([t5] if age <= 5 * 3600 else [])):
+                bucket["in"] += vals[0]
+                bucket["out"] += vals[1]
+                bucket["cache"] += vals[2]
+            if age <= 5 * 3600:
+                msgs5 += 1
+    if recent:
+        out["claude"] = {"last_5h": t5, "last_7d": t7, "messages_5h": msgs5, "note": "Claude Code does not record its plan limits locally; these are tokens used, not a percentage."}
+    out["agy"] = {"note": "Antigravity does not expose usage or limits outside its own window."}
     return out
 
 
@@ -326,6 +414,24 @@ class Ops:
         f.write_text(str(a["content"]), encoding="utf-8")
         return {"file": str(f)}
 
+    async def op_write_context(self, a):
+        """Copy the competition material (documents, images, notes) into this laptop's working folder: .kode/context/."""
+        import base64
+        d = self.path(a["dir"])
+        out = d / ".kode" / "context"
+        out.mkdir(parents=True, exist_ok=True)
+        n = 0
+        for name, b64 in (a.get("files") or {}).items():
+            f = self.safe_file(out, re.sub(r"[^A-Za-z0-9._ -]", "_", str(name))[:120])
+            f.write_bytes(base64.b64decode(b64))
+            n += 1
+        return {"files": n}
+
+    async def op_limits(self, a):
+        """What each agent's own logs say about usage on this laptop. Codex records its real rate-limit windows (used percent, reset time); Claude Code does not record limits,
+        so its token use in the last 5 hours and 7 days is summed from its session logs; Antigravity exposes nothing local. Nothing here calls a model."""
+        return await asyncio.to_thread(scan_limits)
+
     async def op_git_status(self, a):
         d = self.path(a["dir"])
         base, branch = a.get("base", "main"), a.get("branch", "")
@@ -458,6 +564,20 @@ class Ops:
         await self.must(d, "push", "origin", base)
         return {"head": (await self.must(d, "rev-parse", "HEAD")).strip()}
 
+    async def op_remove_files(self, a):
+        """Delete files from the base branch in one commit (the build scaffolding is not part of the finished product)."""
+        d = self.path(a["dir"])
+        base = a.get("base", "main")
+        await self.must(d, "fetch", "origin", "--prune")
+        await self.must(d, "checkout", "-B", base, f"origin/{base}")
+        names = [self.safe_file(d, rel) and rel for rel in (a.get("files") or [])]
+        await self.git(d, "rm", "-q", "-f", "--ignore-unmatch", *names)
+        r = await self.git(d, "commit", "-m", a.get("message", "chore: remove build scaffolding"))
+        if r["code"] != 0 and "nothing to commit" not in r["out"]:
+            raise OpError("commit failed: " + tail(r["out"], 500).strip())
+        await self.must(d, "push", "origin", base)
+        return {"head": (await self.must(d, "rev-parse", "HEAD")).strip()}
+
     async def op_run(self, a):
         d = self.path(a["dir"])
         r = await self.sh([a["cmd"]], d, float(a.get("cmd_timeout", 300)), shell=True)
@@ -473,7 +593,10 @@ class Ops:
         Runs with the same scrubbed environment as that provider's sessions, in a scratch folder inside the workspace root."""
         from bridge.manifests import load_manifests, scrubbed_env
         tool = str(a.get("tool", ""))
-        argv_tail = {"claude": ["-p", "--no-session-persistence"], "codex": ["exec", "--ephemeral", "-s", "read-only", "--skip-git-repo-check", "-"]}.get(tool)
+        sess = str(a.get("session_id", ""))
+        keep = tool == "claude" and re.fullmatch(r"[0-9a-fA-F-]{36}", sess) is not None          # the planner keeps ONE conversation per project: it remembers the plan and every decision
+        claude_tail = ["-p", "--resume", sess] if (keep and a.get("resume")) else ["-p", "--session-id", sess] if keep else ["-p", "--no-session-persistence"]
+        argv_tail = {"claude": claude_tail, "codex": ["exec", "--ephemeral", "-s", "read-only", "--skip-git-repo-check", "-"]}.get(tool)
         m = load_manifests().get(tool)
         if argv_tail is None or m is None or not m.available:
             raise OpError(f"'{tool}' is not available as a planner on this machine")
@@ -501,14 +624,17 @@ class Ops:
         base = a.get("base", "main")
         await self.git(d, "fetch", "origin", "--prune")
         rng = f"{a['since']}..origin/{base}" if a.get("since") else f"origin/{base}"
-        out = (await self.git(d, "log", rng, "--no-merges", "--numstat", "--format=@@%ae\x1f%an"))["out"]
+        out = (await self.git(d, "log", rng, "--no-merges", "--numstat", "--format=@@%ae\x1f%an\x1f%at"))["out"]
         stats: Dict[str, Dict[str, Any]] = {}
         cur = None
         for l in out.splitlines():
             if l.startswith("@@"):
-                email, _, name = l[2:].partition("\x1f")
-                cur = stats.setdefault(email, {"email": email, "name": name, "commits": 0, "added": 0, "removed": 0})
+                email, _, rest = l[2:].partition("\x1f")
+                name, _, at = rest.partition("\x1f")
+                cur = stats.setdefault(email, {"email": email, "name": name, "commits": 0, "added": 0, "removed": 0, "times": []})
                 cur["commits"] += 1
+                if at.isdigit() and len(cur["times"]) < 600:
+                    cur["times"].append(int(at))
             elif cur and "\t" in l:
                 p = l.split("\t")
                 if len(p) == 3 and p[0].isdigit() and p[1].isdigit():

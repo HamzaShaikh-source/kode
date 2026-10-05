@@ -41,3 +41,5 @@ verify_interact.py
 verify_shots.py
 backend/bridge/provider_tiles_check.py
 backend/bridge/spike_browser_check.py
+
+backend/project_data/

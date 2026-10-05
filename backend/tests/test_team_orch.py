@@ -125,9 +125,10 @@ def test_node_side_allowlist_blocks_arbitrary_env_and_args():
     assert apiprofiles.validate_launch({"LD_PRELOAD": "/evil.so"}, []) is not None
     assert apiprofiles.validate_launch({"PATH": "c:\\evil"}, []) is not None
     assert apiprofiles.validate_launch({}, ["--dangerously-skip-permissions"]) is None                 # Turbo mode (the lead's explicit project choice)
-    assert apiprofiles.validate_launch({}, ["--yolo"]) is not None
+    assert apiprofiles.validate_launch({}, ["--yolo"]) is None                                          # Command Code turbo (backup agent)
+    assert apiprofiles.validate_launch({}, ["--exec-anything"]) is not None
     assert apiprofiles.validate_launch({}, ["--mode", "plan-and-delete"]) is not None              # a known flag with a value outside its allow-list
-    assert apiprofiles.validate_launch({}, ["-c"]) is not None                                   # flag without value
+    assert apiprofiles.validate_launch({}, ["-m"]) is not None                                   # flag without value
 
 
 @win

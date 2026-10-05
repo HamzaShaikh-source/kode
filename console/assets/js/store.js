@@ -3,7 +3,7 @@ export const S = {
   role: 'lead', key: '', hubHost: '', nodeId: '',
   connected: false, everConnected: false, authFailed: false, loaded: false,
   nodes: [], sessions: [], requests: [], events: [], modes: ['watch', 'suggest', 'copilot', 'takeover'],
-  suggestions: [], orch: null, projects: [], profiles: [], profilesLoaded: false, route: { name: 'brain', arg: '' }, usage: null,
+  suggestions: [], orch: null, projects: [], presets: [], memory: { hackathons: [], agents: {} }, profiles: [], profilesLoaded: false, route: { name: 'brain', arg: '' }, usage: null,
 };
 const subs = new Set();
 let queued = false;

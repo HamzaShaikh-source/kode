@@ -1,0 +1,6 @@
+id: commandcode
+label: Command Code
+command: [commandcode]
+command_win: [commandcode.cmd]
+tier: 0   # universal PTY adapter
+env_passthrough: [COMMAND_CODE_API_KEY]

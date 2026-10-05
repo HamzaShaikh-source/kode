@@ -183,6 +183,9 @@ class ScriptedLLM:
         self.calls.append(system[:30])
         if "planning lead" in system:
             return LLMResult(json.dumps(make_plan()), 10, 10, "stop")
+        if "asked for changes" in system:
+            return LLMResult(json.dumps({"summary": "add the extra module", "tasks": [{"title": "add extra module", "description": "Add src/extra.py." + script([step({"src/extra.py": "VALUE = 1" + chr(10)}, "feat: add extra module")]),
+                                                                                       "files_owned": ["src/extra.py"], "must": ["define VALUE"], "must_not": ["touch other files"], "owner_task": "T1"}]}), 10, 10, "stop")
         if "member of a panel judging" in system:
             card = {"scores": {k: {"score": 8, "evidence": f"{k} looks sound in src/calc.py"} for k in ("fit", "function", "quality", "testing", "docs", "security", "innovation")},
                     "strengths": ["small, tested, documented"], "improvements": [], "summary": "A tidy small library."}
@@ -219,13 +222,37 @@ def test_project_loop_plan_build_guard_merge_verify_fix_done(tmp_path, monkeypat
                                     auto_approve_plan=True, permissions="auto", planner={"kind": "default"})
                 assert r["ok"], r
                 pid = r["id"]
-                try:
-                    await until(lambda: lead.projects.get(pid, {}).get("status") in ("done", "failed"), 240, step=0.5)
-                except AssertionError:
-                    q = lead.projects[pid]
-                    raise AssertionError((q["phase"], [x["text"] for x in q["log"][-14:]], [(t["id"], t["status"]) for t in q["tasks"]]))
+                async def reach(*states, secs=240):
+                    try:
+                        await until(lambda: lead.projects.get(pid, {}).get("status") in states + ("failed",), secs, step=0.5)
+                    except AssertionError:
+                        q = lead.projects[pid]
+                        raise AssertionError((q["status"], q["phase"], [x["text"] for x in q["log"][-14:]], [(t["id"], t["status"]) for t in q["tasks"]]))
+                    assert lead.projects[pid]["status"] in states, (lead.projects[pid]["status"], lead.projects[pid].get("error"), [x["text"] for x in lead.projects[pid]["log"][-12:]])
+                # verify, polish and judge pass, then the lead is asked: nothing is "done" until a human says so
+                await reach("review")
                 p = lead.projects[pid]
-                assert p["status"] == "done", (p["status"], p.get("error"), [x["text"] for x in p["log"][-12:]])
+                assert p["report"]["tests_passed"] and p["report"]["judge"]["grade"] == "A" and p["report"]["tasks"] and "screenshots" in p["report"]["limits"][0]
+                # the lead asks for a change: the planner turns it into a task, it is built, verified, judged, and shown again
+                n_before = len(p["tasks"])
+                r = await lead.call(t="project_feedback", id=pid, text="Please add an extra module with a VALUE constant.", tasks=["T1"])
+                assert r["ok"], r
+                await until(lambda: lead.projects[pid]["status"] == "running", 20, step=0.2)
+                await reach("review")
+                p = lead.projects[pid]
+                assert len(p["tasks"]) == n_before + 1 and any(t["id"] == "R1-1" and t["status"] == "merged" for t in p["tasks"]) and p["report"]["rework_rounds"] == 1
+                r = await lead.call(t="project_feedback", id=pid, approve=True)
+                assert r["ok"], r
+                await reach("done")
+                p = lead.projects[pid]
+                # the handoff file carries everything another AI needs, including the session list
+                h = await lead.call(t="project_handoff", id=pid)
+                assert h["ok"] and "git clone" in h["text"] and "Frozen contract" in h["text"] and "R1-1" in h["text"] and "demo-agent" in h["text"] and h["name"].endswith("-context.md")
+                assert p["sessions"] and all(x["sid"] and x["member"] for x in p["sessions"]) and p["usage"]["plan"]["calls"] >= 1
+                # the lead closes the event: results and agent track record are remembered
+                r = await lead.call(t="project_complete", id=pid)
+                assert r["ok"]
+                await until(lambda: lead.projects[pid].get("completed"), 10)
                 # fair split: everyone got work and made commits
                 owners = {}
                 for t in p["tasks"]:
@@ -237,7 +264,7 @@ def test_project_loop_plan_build_guard_merge_verify_fix_done(tmp_path, monkeypat
                 assert sum(b["violations"] for b in bal.values()) >= 2
                 assert all(b["commits"] >= 2 for b in bal.values()), bal                     # real commits, authored by each member's own identity
                 # fix round happened because the first verification failed
-                assert p["round"] == 1 and any(t["id"].startswith("F1") for t in p["tasks"])
+                assert any(t["id"].startswith("F1") for t in p["tasks"])      # (the rework reset the round counter for its own budget)
                 assert p["verify"]["passed"]
                 assert p["final"]["judge"]["grade"] == "A" and p["judge"]["overall"] == 80.0 and len(p["judge"]["judges"]) >= 1     # the code judge scored the finished repo
                 assert any("reusing" in x["text"] for x in p["log"]), "teammates' agent sessions are reused across their tasks"
@@ -247,7 +274,8 @@ def test_project_loop_plan_build_guard_merge_verify_fix_done(tmp_path, monkeypat
                 clone = tmp_path / "inspect"
                 subprocess.run(["git", "clone", remote, str(clone)], capture_output=True)
                 files = set(git(clone, "ls-files").split())
-                assert {"src/calc.py", "src/fmt.py", "tests/test_calc.py", "tests/test_fmt.py", "README.md", "src/main.py", "docs/CONTRACT.md", "docs/SUBMISSION.md"} <= files
+                assert {"src/calc.py", "src/fmt.py", "tests/test_calc.py", "tests/test_fmt.py", "README.md", "src/main.py", "docs/CONTRACT.md", "docs/SUBMISSION.md", "src/extra.py"} <= files
+                assert not ({"CLAUDE.md", "AGENTS.md", "PLAN.md"} & files), "the build scaffolding is not part of the finished repository"
                 assert "src/evil.py" not in files and "tests/__keep__.txt" not in files
                 assert "tampered" not in (clone / "docs" / "CONTRACT.md").read_text()
                 assert "a * b" in (clone / "src" / "calc.py").read_text()

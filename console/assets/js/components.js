@@ -13,7 +13,7 @@ export function modal({ title, body, actions = [], onClose, wide }) {
   const root = $('#modal-root');
   const prev = document.activeElement;
   const back = h('div', { class: 'modal-back' });
-  const dlg = h('div', { class: 'modal', role: 'dialog', 'aria-modal': 'true', 'aria-label': title, style: wide ? { width: 'min(640px,100%)' } : null },
+  const dlg = h('div', { class: 'modal' + (wide ? ' xl' : ''), role: 'dialog', 'aria-modal': 'true', 'aria-label': title },
     h('h2', {}, title), body, actions.length ? h('div', { class: 'row' }, actions) : null);
   back.append(dlg);
   const close = () => { back.remove(); document.removeEventListener('keydown', key, true); if (prev && prev.focus) prev.focus(); if (onClose) onClose(); };

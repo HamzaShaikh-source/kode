@@ -28,7 +28,7 @@ import time
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Optional
 
-from hub import ideate, judge as jd
+from hub import context as ctx, ideate, judge as jd
 from hub.protocol import ROLE_LEAD, clip, now_ms
 from llm import LLMOutputError, extract_json
 
@@ -46,6 +46,10 @@ NET_BACKOFF = (3, 6, 12, 25, 45, 60)
 REATTACH_S = 20.0           # after a laptop reconnects, its sessions are re-announced within this window
 TRANSIENT = re.compile(r"offline|unreachable|timed out|timeout|unable to access|could not resolve|connection (reset|refused|closed|aborted)|network|early eof|rpc failed|"
                        r"tls|ssl|remote end hung up|fetch origin|failed to connect|temporary failure|no laptop online|try again|rate limit|502|503|504", re.I)
+BUSY_RX = re.compile(r"esc to interrupt|ctrl\+c to interrupt|Working \(|\(esc to cancel\)|Thinking|[\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f]")
+LIMIT_RX = re.compile(r"usage limit|rate[- ]limit(?:ed)?|limit reached|quota (?:exceeded|exhausted)|out of (?:credits|tokens)|insufficient (?:credits|quota|balance)|credit balance is too low|you(?:'|\u2019)ve hit your|overloaded_error|resource_exhausted|too many requests", re.I)
+API_ERR = re.compile(r"API error|Retrying in \d+s|attempt \d+/\d+|ECONNRESET|connection (?:error|reset)", re.I)
+BACKUP_ORDER = ("commandcode", "claude", "codex", "agy", "opencode", "hermes")
 NUDGE_IDLE_S = 45.0          # a slow model thinks for a while: only remind an agent that has been silent AND commit-less for a few minutes
 NUDGE_QUIET_S = 180.0
 PROMPT_COOLDOWN_S = 5.0
@@ -118,6 +122,8 @@ def normalize_plan(obj: dict, n_members: int) -> dict:
             raise PlanError(f"task id '{tid}' is duplicated or malformed")
         ids.add(tid)
         files = [str(f).strip() for f in (t.get("files_owned") or []) if str(f).strip()]
+        must = [clip(str(x).strip(), 200) for x in (t.get("must") or []) if str(x).strip()][:6] if isinstance(t.get("must"), list) else []
+        must_not = [clip(str(x).strip(), 200) for x in (t.get("must_not") or []) if str(x).strip()][:6] if isinstance(t.get("must_not"), list) else []
         if not files or any(not _safe_rel(f.replace("*", "x")) for f in files):
             raise PlanError(f"task {tid}: 'files_owned' needs relative paths/globs (no '..', no absolute paths, nothing under .git or .kode)")
         title, desc = clip(str(t.get("title", "")).strip(), 120), clip(str(t.get("description", "")).strip(), 3000)
@@ -125,7 +131,7 @@ def normalize_plan(obj: dict, n_members: int) -> dict:
             raise PlanError(f"task {tid}: needs a title and a description")
         weight = max(1, min(3, int(t.get("weight") or 1)))
         out.append({"id": tid, "title": title, "description": desc, "acceptance": clip(str(t.get("acceptance", "")).strip(), 1200),
-                    "files_owned": files, "depends_on": [str(d) for d in (t.get("depends_on") or [])], "weight": weight})
+                    "files_owned": files, "depends_on": [str(d) for d in (t.get("depends_on") or [])], "weight": weight, "must": must, "must_not": must_not})
     for t in out:
         for d in t["depends_on"]:
             if d not in ids or d == t["id"]:
@@ -193,7 +199,8 @@ project in parallel from one git repository. Produce a build plan as ONE JSON ob
  "setup_cmds": ["<shell command to install dependencies, if any>"],
  "test_cmds": ["<shell command(s) that exit 0 only when the whole project works>"],
  "tasks": [{"id": "T1", "title": "...", "description": "what to build, precisely, referring to the contract", "acceptance": "observable checks",
-            "files_owned": ["api/**"], "depends_on": [], "weight": 1}]
+            "files_owned": ["api/**"], "depends_on": [], "weight": 1,
+            "must": ["2-5 short things this task has to deliver"], "must_not": ["2-5 short things it must not do, e.g. edit files it does not own"]}]
 }
 
 RULES
@@ -204,6 +211,13 @@ RULES
 - Keep contract files compact (about 60 lines in total) and task descriptions to 2-4 sentences each: the whole reply must stay short.
 - The project must be small enough to finish in the available time, run locally without paid services, and be verifiable by test_cmds (use only tools
   that are commonly installed: python, node/npm). The tests must really exercise the code, not just print OK.
+- INTEGRATION (most failures come from here): the contract states the exact file and module layout (package names, which module exports which public functions and classes,
+  the entry point and how it is started). Every module that another task imports is owned by exactly ONE task and appears in the contract. One task owns the wiring
+  (app entry point, package __init__, static hosting) and imports ONLY what the contract lists. Never reference a module that no task owns. Dependencies live in one
+  requirements/package file owned by one task and listed in setup_cmds.
+- Every task has "must" and "must_not" lists so each agent knows exactly what is in and out of scope. They follow ONE plan and ONE contract; no agent invents interfaces.
+- Where the lead attached competition context (event rules, judging criteria, links, documents), the plan must serve it: judging criteria shape the scope and the README.
+- Where a teammate has skills installed, name the ones that fit in the task description (e.g. "use the test-driven-development skill"). Only name skills listed for that team.
 - Every one of the {n} teammates must own SUBSTANTIAL, meaningful work (a real feature or module, not busywork). Shares need not be identical.
 - The finished repository will be judged like a professional project, by engineers and by AI reviewers. Plan for that: one task owns a complete README.md
   (what it is, features, prerequisites, setup, how to run, how to test, project structure), another owns real tests, the code is clean and consistent,
@@ -238,8 +252,9 @@ These are the working conventions for everyone, including you.
 4. Work on your task branch only, never on `{p['base']}`. Push it with `git push -u origin <your-branch>` after your first commit and again at the end.
 5. Work on your own: the team lead is not available for questions during the task. If something is unclear, follow the contract and pick the simplest sensible option.
 6. When everything is committed and pushed, print one line `KODE_DONE <number of commits>` so the lead's dashboard can see that you finished.
-7. If your agent has skills or plugins installed (testing, code review, security review, frontend design, debugging), use the ones that fit your task: TASK.md lists the relevant ones. Prefer them to improvising.
-8. You are one long-lived session that may be given several tasks one after another: finish each task completely, then wait for the next one; never start other sessions or sub-agents unless the task needs them.
+7. The lead may have attached competition context (rules, judging criteria, documents, images): it is in `.kode/context/` in your working folder, start with INDEX.md.
+8. If your agent has skills or plugins installed (testing, code review, security review, frontend design, debugging), use the ones that fit your task: TASK.md lists the relevant ones. Prefer them to improvising.
+9. You are one long-lived session that may be given several tasks one after another: finish each task completely, then wait for the next one; never start other sessions or sub-agents unless the task needs them.
 """
 
 
@@ -263,6 +278,13 @@ def pick_skills(skills: List[dict], text: str, limit: int = 8) -> List[dict]:
 def render_task(p: dict, t: dict, branch: str, contract_paths: List[str], skills: Optional[List[dict]] = None) -> str:
     deps = ", ".join(t["depends_on"]) or "none"
     use = pick_skills(skills or [], " ".join([t["title"], t["description"], " ".join(t["files_owned"])]))
+    do_block = ""
+    if t.get("must"):
+        do_block += "## You must" + chr(10) + chr(10).join("- " + x for x in t["must"]) + chr(10) + chr(10)
+    if t.get("must_not"):
+        do_block += "## You must not" + chr(10) + chr(10).join("- " + x for x in t["must_not"]) + chr(10) + chr(10)
+    if p.get("context"):
+        do_block += "## Competition context (in .kode/context/, read INDEX.md first)" + chr(10) + ctx.summary(p, 2500) + chr(10) + chr(10)
     skill_block = ("## Skills installed on this laptop (use the ones that fit; invoke them instead of improvising)" + chr(10) + chr(10).join(f"- {s['name']}: {s['description']}" for s in use) + chr(10) * 2) if use else ""
     return f"""# Task {t['id']}: {t['title']}
 
@@ -275,7 +297,7 @@ Brief: {p['brief']}
 ## Acceptance
 {t.get('acceptance') or 'It does what the description says and works with the contract.'}
 
-## Your scope (the ONLY files you may create or edit)
+{do_block}## Your scope (the ONLY files you may create or edit)
 {chr(10).join('- ' + g for g in t['files_owned'])}
 
 ## Frozen contract (read, never edit)
@@ -310,16 +332,37 @@ KEYMAP = {"enter": chr(13), "esc": chr(27), "tab": chr(9), "space": " ", "up": c
 class CliClient:
     """Planner backed by a teammate's own logged-in CLI, run on that laptop through the node (see node/ops.py op_cli_complete)."""
 
-    def __init__(self, engine: "ProjectEngine", provider: str, node_id: str):
-        self.engine, self.provider, self.node_id = engine, provider, node_id
+    def __init__(self, engine: "ProjectEngine", provider: str, node_id: str, session: str = ""):
+        self.engine, self.provider, self.node_id, self.session = engine, provider, node_id, session
 
     async def complete(self, system: str, user: str, *, max_tokens: int = 0):
         from llm import LLMResult
-        r = await self.engine.hub.node_op(self.node_id, "cli_complete", 900.0, tool=self.provider, cmd_timeout=840,
-                                          prompt=system + chr(10) * 2 + user + chr(10) * 2 + "Reply with the JSON object only, no commentary and no code fences.")
+        prompt = system + chr(10) * 2 + user + chr(10) * 2 + "Reply with the JSON object only, no commentary and no code fences."
+        sid = str(__import__("uuid").uuid5(__import__("uuid").NAMESPACE_URL, "kode-planner-" + self.session)) if self.session else ""
+        again = bool(sid) and self.engine.psess.get(self.session, False)
+        r = await self.engine.hub.node_op(self.node_id, "cli_complete", 900.0, tool=self.provider, cmd_timeout=840, prompt=prompt,
+                                          **({"session_id": sid, "resume": again} if sid else {}))
+        if not r.get("ok") and sid and again and ("session" in str(r.get("err", "")).lower() or "conversation" in str(r.get("err", "")).lower()):
+            r = await self.engine.hub.node_op(self.node_id, "cli_complete", 900.0, tool=self.provider, cmd_timeout=840, prompt=prompt,
+                                              session_id=str(__import__("uuid").uuid4()), resume=False)             # the saved conversation is gone: start a new one
         if not r.get("ok"):
             raise RuntimeError(f"planner ({self.provider} CLI): {r.get('err', 'failed')}")
+        if sid:
+            self.engine.psess[self.session] = True
         return LLMResult(r["text"], 0, 0, "stop")
+
+
+class Metered:
+    """Wraps a model client and records what every call costs (estimated from text length when the provider reports no tokens)."""
+
+    def __init__(self, inner, ledger, purpose: str):
+        self.inner, self.ledger, self.purpose = inner, ledger, purpose
+
+    async def complete(self, system: str, user: str, *, max_tokens: int = 0):
+        t0 = time.time()
+        res = await self.inner.complete(system, user, max_tokens=max_tokens)
+        self.ledger(self.purpose, res, system, user, time.time() - t0)
+        return res
 
 
 class ProjectEngine:
@@ -332,6 +375,8 @@ class ProjectEngine:
         self.sup_cache: Dict[str, Dict[str, dict]] = {}       # project id -> normalised dialog -> the supervisor's earlier answer (no model call for repeats)
         self.sup_calls: Dict[str, int] = {}
         self.sup_down: Dict[str, float] = {}
+        self.pending_ctx: Dict[str, list] = {}                # context items sent with project_create, ingested when planning starts (never stored raw)
+        self.psess: Dict[str, bool] = {}                      # project id -> the planner's Claude session already exists
 
     # ───────────── persistence / state out ─────────────
     def load(self) -> None:
@@ -418,11 +463,20 @@ class ProjectEngine:
         self.save(p)
 
     def save(self, p: dict) -> None:
+        key = f"{p.get('status')}/{p.get('phase')}"
+        tl = p.setdefault("timeline", [])
+        if not tl or tl[-1]["k"] != key:
+            now = time.time()
+            if tl and not tl[-1]["end"]:
+                tl[-1]["end"] = now
+            tl.append({"k": key, "status": p.get("status"), "phase": p.get("phase"), "start": now, "end": 0})
+            del tl[:-120]
         self.hub.store.save_project(p["id"], p)
         self.hub.push_projects()
 
     def public(self, p: dict) -> dict:
-        q = {k: v for k, v in p.items() if k not in ("log", "plan", "cards")}
+        q = {k: v for k, v in p.items() if k not in ("log", "plan", "cards", "context", "ctx_sent", "msess")}
+        q["context"] = ctx.public(p)
         plan = p.get("plan") or {}
         q["plan"] = {"summary": plan.get("summary", ""), "stack": plan.get("stack", ""), "test_cmds": plan.get("test_cmds", []), "setup_cmds": plan.get("setup_cmds", []),
                      "contract_files": sorted((plan.get("contract_files") or {}).keys()), "contract_preview": {k: clip(v, 1800) for k, v in list((plan.get("contract_files") or {}).items())[:4]}}
@@ -431,7 +485,9 @@ class ProjectEngine:
         return q
 
     def public_all(self) -> dict:
-        return {"projects": [self.public(p) for p in sorted(self.items.values(), key=lambda x: -x.get("created", 0))]}
+        mem = self.memory()
+        return {"projects": [self.public(p) for p in sorted(self.items.values(), key=lambda x: -x.get("created", 0))], "presets": self.jget("presets", []),
+                "memory": {"hackathons": mem.get("hackathons", [])[-8:], "agents": mem.get("agents", {})}}
 
     def log(self, p: dict, kind: str, text: str, task: str = "") -> None:
         p.setdefault("log", []).append({"ts": now_ms(), "kind": kind, "text": clip(text, 400), "task": task})
@@ -458,17 +514,120 @@ class ProjectEngine:
             return f"API profile {pl.get('profile_id')} / {pl.get('model') or 'default model'}"
         return "Brain default model"
 
-    def client(self, p: Optional[dict] = None):
+    def cfg(self, key: str, default):
+        try:
+            raw = self.hub.store.get_setting("proj." + key)
+        except Exception:
+            raw = ""
+        if raw in ("", None):
+            return default
+        try:
+            return type(default)(float(raw)) if isinstance(default, (int, float)) and not isinstance(default, bool) else (raw.lower() in ("1", "true", "yes") if isinstance(default, bool) else raw)
+        except (TypeError, ValueError):
+            return default
+
+    def jget(self, key: str, default):
+        try:
+            raw = self.hub.store.get_setting(key)
+            return json.loads(raw) if raw else default
+        except Exception:
+            return default
+
+    def jset(self, key: str, value) -> None:
+        self.hub.store.set_setting(key, json.dumps(value))
+
+    def memory(self) -> dict:
+        return self.jget("memory", {"hackathons": [], "agents": {}})
+
+    def ledger(self, p: dict, purpose: str, res, system: str, user: str, secs: float) -> None:
+        u = p.setdefault("usage", {}).setdefault(purpose, {"calls": 0, "in": 0, "out": 0, "secs": 0.0})
+        u["calls"] += 1
+        u["in"] += int(getattr(res, "prompt_tokens", 0) or 0) or (len(system) + len(user)) // 4
+        u["out"] += int(getattr(res, "completion_tokens", 0) or 0) or len(res.text) // 4
+        u["secs"] = round(u["secs"] + secs, 1)
+
+    def metered(self, p: dict, client, purpose: str):
+        return Metered(client, lambda *a: self.ledger(p, *a), purpose)
+
+    def now(self, p: dict, text: str, sub: str = "") -> None:
+        """One plain sentence for the console: what the Brain is doing right now (the console adds a ticking timer)."""
+        p["now"] = {"text": text, "sub": sub, "since": time.time()}
+
+    def steps(self, p: dict, items: list) -> None:
+        """The checklist the console shows while the Brain works: what is happening now and what comes next."""
+        p["steps"] = [{"id": i, "title": t, "detail": d, "state": "pending", "started": 0, "ended": 0} for i, t, d in items]
+        self.save(p)
+
+    def step(self, p: dict, sid: str, state: str, detail: Optional[str] = None) -> None:
+        st = next((x for x in p.get("steps", []) if x["id"] == sid), None)
+        if not st:
+            return
+        if state == "working" and not st["started"]:
+            st["started"] = time.time()
+        if state in ("done", "failed", "skipped"):
+            st["ended"] = time.time()
+        st["state"] = state
+        if detail is not None:
+            st["detail"] = detail
+        self.save(p)
+
+    async def ingest_context(self, p: dict, items: list) -> None:
+        for it in items[:ctx.MAX_ITEMS]:
+            try:
+                if it.get("url"):
+                    self.log(p, "context", f"reading {clip(it['url'], 80)}")
+                    await ctx.add_link(p, it["url"])
+                elif it.get("b64"):
+                    ctx.add_file(p, it.get("name", "file"), it.get("mime", ""), it["b64"])
+                elif it.get("text"):
+                    ctx.add_note(p, it["text"], it.get("name", "Note"))
+            except ctx.ContextError as e:
+                self.log(p, "warn", f"context item skipped: {e}")
+            except Exception as e:
+                self.log(p, "warn", f"context item skipped: {type(e).__name__}: {clip(str(e), 120)}")
+        self.save(p)
+
+    CLARIFY_SYSTEM = """You are the planning lead of a hackathon team. Before writing the plan, decide whether you need answers from the team lead to build what they actually want.
+Ask ONLY questions whose answers would change what gets built (target users, must-have vs nice-to-have, required tech or APIs, demo format, deadline, judging priorities).
+Skip anything the brief or the attached context already answers. At most 5 questions; if the brief is clear, ask none. Offer 2-4 likely options when it helps, and a sensible default.
+Reply with ONLY one JSON object: {"questions": [{"id": "q1", "q": "the question", "why": "what it changes", "options": ["a", "b"], "default": "a"}]}"""
+
+    async def clarify(self, p: dict) -> list:
+        self.step(p, "clarify", "working", "The planner is reading your brief and attached material to decide what it needs to ask you")
+        user = f"PROJECT: {p['name']}{chr(10)}BRIEF:{chr(10)}{p['brief']}{chr(10)}"
+        if ctx.summary(p):
+            user += f"{chr(10)}ATTACHED CONTEXT:{chr(10)}{ctx.summary(p)}{chr(10)}"
+        try:
+            res = await asyncio.wait_for(self.client(p, "questions").complete(self.CLARIFY_SYSTEM, user, max_tokens=1500), 300)
+            qs = extract_json(res.text).get("questions") or []
+        except Exception as e:
+            self.log(p, "warn", f"the planner could not prepare questions ({type(e).__name__}); planning without them")
+            self.step(p, "clarify", "skipped", "No questions; planning directly")
+            return []
+        out = []
+        for i, q in enumerate(qs[:5]):
+            if isinstance(q, dict) and str(q.get("q", "")).strip():
+                out.append({"id": str(q.get("id") or f"q{i + 1}")[:8], "q": clip(str(q["q"]), 300), "why": clip(str(q.get("why", "")), 200),
+                            "options": [clip(str(o), 80) for o in (q.get("options") or [])][:4] if isinstance(q.get("options"), list) else [], "default": clip(str(q.get("default", "")), 120)})
+        self.step(p, "clarify", "done", f"{len(out)} question(s) for you" if out else "Nothing to ask: the brief is clear")
+        return out
+
+    def client(self, p: Optional[dict] = None, purpose: str = "plan"):
         """The model that writes the plan and diagnoses failures, exactly as the lead chose it for this project:
         a teammate's own CLI login (Claude Code / Codex), one of the saved API profiles, or the Brain's default. Plans are long, so a slow model
         gets far more time than a chat turn."""
+        if p is None:
+            return self._client(p)
+        return self.metered(p, self._client(p), purpose)
+
+    def _client(self, p: Optional[dict] = None):
         if self.llm_override is not None:
             return self.llm_override
         from hub.orchestrator import ProfileClient
         from llm import RetryingLLM
         pl = (p or {}).get("planner") or {}
         if pl.get("kind") == "cli":
-            return CliClient(self, pl["provider"], pl.get("node_id", ""))
+            return CliClient(self, pl["provider"], pl.get("node_id", ""), session=(p or {}).get("id", "") if pl["provider"] == "claude" else "")
         if pl.get("kind") == "profile":
             prof = self.hub.store.get_profile(pl.get("profile_id", ""), with_key=True)
             if not prof:
@@ -480,7 +639,10 @@ class ProjectEngine:
             return RetryingLLM(inner, max_tries=2, base_delay_s=2.0, deadline_s=900)
         return o._client()
 
-    def member_client(self, p: dict, m: dict):
+    def member_client(self, p: dict, m: dict, purpose: str = "ideas"):
+        return self.metered(p, self._member_client(p, m), purpose)
+
+    def _member_client(self, p: dict, m: dict):
         """A teammate's own model for one-shot questions (ideas, votes, judging): their API profile, or their Claude Code / Codex login, else the planner."""
         if self.llm_override is not None:
             return self.llm_override
@@ -531,12 +693,84 @@ class ProjectEngine:
             elif t == "project_resume" and p and (p["status"] == "paused" or (p["status"] == "failed" and p["phase"] != "plan" and p.get("plan"))):
                 self.start(p)
                 await res(ok=True)
-            elif t == "project_cancel" and p and p["status"] in ("running", "paused", "planning", "plan_ready"):
+            elif t == "project_cancel" and p and p["status"] in ("running", "paused", "planning", "plan_ready", "questions", "review"):
                 await self.cancel(p)
                 await res(ok=True)
             elif t == "project_delete" and p and p["status"] not in ("running", "planning"):
                 self.items.pop(pid, None)
                 self.hub.store.delete_project(pid)
+                self.hub.push_projects()
+                await res(ok=True)
+            elif t == "project_context_add" and p and p["status"] not in ("cancelled",):
+                try:
+                    if m.get("url"):
+                        await ctx.add_link(p, str(m["url"]))
+                    elif m.get("b64"):
+                        ctx.add_file(p, str(m.get("name", "file")), str(m.get("mime", "")), m["b64"])
+                    elif str(m.get("text", "")).strip():
+                        ctx.add_note(p, str(m["text"]), str(m.get("name", "Note")))
+                    else:
+                        raise ctx.ContextError("nothing to add")
+                    p.get("ctx_sent", {}).clear()                              # laptops get the new material with their next task
+                    self.log(p, "context", "context added")
+                    await res(ok=True)
+                except ctx.ContextError as e:
+                    await res(ok=False, err=str(e))
+            elif t == "project_context_remove" and p:
+                ctx.remove(p, str(m.get("item", "")))
+                p.get("ctx_sent", {}).clear()
+                self.save(p)
+                await res(ok=True)
+            elif t == "project_answers" and p and p["status"] == "questions":
+                ans = m.get("answers") if isinstance(m.get("answers"), dict) else {}
+                p["answers"] = [] if m.get("skip") else [{"q": q["q"], "a": clip(str(ans.get(q["id"]) or q.get("default") or "your call"), 400)} for q in p.get("questions", [])]
+                p["questions"] = []
+                self.log(p, "plan", "the lead answered the planner's questions" if p["answers"] else "the lead let the planner decide")
+                self.start_planning(p)
+                await res(ok=True)
+            elif t == "project_feedback" and p and p["status"] == "review":
+                if m.get("approve"):
+                    p["note"] = "Finishing up..."
+                    self._spawn(p, self.net_retry(p, "final report", lambda: self.finalize(p)))
+                    await res(ok=True)
+                elif str(m.get("text", "")).strip():
+                    p["status"], p["phase"], p["note"] = "running", "build", "Turning your feedback into tasks..."
+                    self._spawn(p, self.rework(p, clip(str(m["text"]).strip(), 2000), [str(x) for x in (m.get("tasks") or [])][:12]))
+                    await res(ok=True)
+                else:
+                    await res(ok=False, err="write what should change, or approve")
+            elif t == "project_complete" and p and p["status"] == "done" and not p.get("completed"):
+                self.complete_hackathon(p)
+                await res(ok=True)
+            elif t == "project_task" and p and str(m.get("action")) in ("retry", "skip", "switch", "ask"):
+                tk = next((x for x in p["tasks"] if x["id"] == m.get("task")), None)
+                if tk and tk["status"] in ("running", "starting", "pending", "blocked"):
+                    await self.answer_card(p, {"id": "", "kind": "stalled", "task": tk["id"], "sid": tk.get("sid", "")}, str(m["action"]))
+                    await res(ok=True)
+                else:
+                    await res(ok=False, err="that task is not in progress")
+            elif t == "project_stats" and p and p.get("coordinator") and p.get("repo"):
+                st = await self.op(p["coordinator"], "log_stats", 60, dir=self.cdir(p), base=p["base"], since=p.get("base_sha", ""))
+                by = {a["email"].lower(): a for a in st.get("authors", [])}
+                await res(ok=True, members=[{"member": mm["name"], "times": by.get((mm.get("git_email") or "").lower(), {}).get("times", []), "commits": by.get((mm.get("git_email") or "").lower(), {}).get("commits", 0),
+                                              "added": by.get((mm.get("git_email") or "").lower(), {}).get("added", 0)} for mm in p["members"]])
+            elif t == "project_handoff" and p:
+                self.write_handoff(p)
+                await res(ok=True, name=f"{slug(p['name'], 30)}-context.md", text=self.build_handoff(p))
+            elif t == "preset_save":
+                name = clip(str(m.get("name", "")).strip(), 50)
+                if not name:
+                    await res(ok=False, err="give the preset a name")
+                else:
+                    pres = [x for x in self.jget("presets", []) if x.get("name") != name]
+                    pres.append({"name": name, "members": [{"member": clip(str(x.get("member", "")), 60), "provider": str(x.get("provider", ""))[:20], "pool": [str(a)[:20] for a in (x.get("pool") or [])][:8], "profile_id": str(x.get("profile_id", ""))[:40]} for x in (m.get("members") or [])][:12],
+                                 "planner": m.get("planner") if isinstance(m.get("planner"), dict) else {}, "permissions": m.get("permissions", "turbo"), "backup": [str(b)[:20] for b in (m.get("backup") or [])][:5],
+                                 "review": m.get("review", "human"), "ask_questions": bool(m.get("ask_questions")), "hackathon": bool(m.get("hackathon"))})
+                    self.jset("presets", pres[-20:])
+                    self.hub.push_projects()
+                    await res(ok=True)
+            elif t == "preset_delete":
+                self.jset("presets", [x for x in self.jget("presets", []) if x.get("name") != m.get("name")])
                 self.hub.push_projects()
                 await res(ok=True)
             elif t == "project_judge" and p and p["status"] in ("done", "failed", "paused") and p.get("repo") and p.get("coordinator"):
@@ -578,7 +812,9 @@ class ProjectEngine:
             prov = str(cfg.get("provider") or self.default_provider(n))
             if not any(pr.get("id") == prov and pr.get("available") for pr in n.providers):
                 raise ValueError(f"{n.name}: provider '{prov}' is not available there")
-            members.append({"node_id": n.id, "name": n.member_name or n.name, "provider": prov, "profile_id": str(cfg.get("profile_id", "")), "model": str(cfg.get("model", ""))})
+            pool = [str(a) for a in (cfg.get("pool") or []) if any(pr.get("id") == a and pr.get("available") for pr in n.providers)][:8]
+            members.append({"node_id": n.id, "name": n.member_name or n.name, "provider": prov, "profile_id": str(cfg.get("profile_id", "")), "model": str(cfg.get("model", "")),
+                            "pool": list(dict.fromkeys([prov] + pool))})
         if not members:
             raise ValueError("no online teammate selected")
         pid = "p_" + secrets.token_hex(3)
@@ -592,7 +828,11 @@ class ProjectEngine:
              "user_test_cmds": [str(c) for c in (m.get("test_cmds") or []) if str(c).strip()][:5],
              "planner": self.parse_planner(m.get("planner"), members), "slug": f"{slug(name, 18)}-{pid[2:]}", "feedback": "",
              "repo_name": rname or slug(name, 40), "visibility": "public" if m.get("visibility") == "public" else "private", "polish_round": 0,
-             "hackathon": bool(m.get("hackathon")), "judge_round": 0}
+             "hackathon": bool(m.get("hackathon")), "judge_round": 0,
+             "ask_questions": bool(m.get("ask_questions")), "review": "auto" if m.get("review") == "auto" else "human",
+             "backup": [str(b) for b in (m.get("backup") or []) if re.fullmatch(r"[a-z0-9-]{1,20}", str(b))][:5], "context": [], "usage": {}, "sessions": []}
+        if isinstance(m.get("context"), list) and m["context"]:
+            self.pending_ctx[pid] = m["context"][:ctx.MAX_ITEMS]
         self.items[pid] = p
         self.save(p)
         self.start_planning(p)
@@ -643,10 +883,40 @@ class ProjectEngine:
         self._spawn(p, self.plan_flow(p))
 
     async def plan_flow(self, p: dict) -> None:
-        if p.get("hackathon") and not (p.get("ideation") or {}).get("winner"):
+        """Everything that happens before the build, with a live checklist: context, ideas (hackathon mode), questions, then the plan itself."""
+        pend = self.pending_ctx.pop(p["id"], None)
+        hack = bool(p.get("hackathon")) and not (p.get("ideation") or {}).get("winner")
+        ask = bool(p.get("ask_questions")) and not p.get("questions_done")
+        items = []
+        if pend or p.get("context"):
+            items.append(("context", "Reading the attached context", "Links are fetched, PDFs and documents are turned into text so the planner and every agent can use them"))
+        if hack:
+            items.append(("ideate", "Ideas, critique and vote", "Every agent researches the problem and proposes ideas, they critique and answer each other anonymously, then each votes (never for its own idea)"))
+        if ask:
+            items.append(("clarify", "Questions for you", "The planner asks only what would change what gets built. You can answer or let it decide"))
+        items += [("plan", "Writing the plan and the contract", "Tasks with exact files, a frozen interface contract and what each task must and must not do"),
+                  ("check", "Checking the plan", "File ownership must not overlap, dependencies must not loop, there must be tests to verify the result")]
+        self.steps(p, items)
+        if pend or p.get("context"):
+            self.step(p, "context", "working")
+            if pend:
+                await self.ingest_context(p, pend)
+            self.step(p, "context", "done", f"{len(p.get('context') or [])} item(s) ready")
+        if hack:
+            self.step(p, "ideate", "working")
             await ideate.run(self, p)
+            self.step(p, "ideate", "done", "Winner: " + (p.get("ideation") or {}).get("winner_title", ""))
             p["phase"], p["note"] = "plan", "Drafting the plan..."
             self.save(p)
+        if ask:
+            qs = await self.clarify(p)
+            p["questions_done"] = True
+            if qs:
+                p["questions"], p["status"], p["phase"] = qs, "questions", "plan"
+                p["note"] = "The planner has a few questions. Answer them (or let it decide) and planning continues."
+                self.notify(p, "info", "The planner has questions for you before it writes the plan.")
+                self.save(p)
+                return
         await self.plan(p)
 
     def start(self, p: dict) -> None:
@@ -669,10 +939,19 @@ class ProjectEngine:
     # ───────────── planning ─────────────
     async def plan(self, p: dict) -> None:
         n = len(p["members"])
-        client = self.client(p)
-        roster = "\n".join(f"- {m['name']} (agent: {m['provider']})" for m in p["members"])
+        client = self.client(p, "plan")
+        pre = await asyncio.gather(*(self.op(m["node_id"], "preflight", 60) for m in p["members"]))
+        for m, r in zip(p["members"], pre):
+            if r.get("ok"):
+                m["skills"] = [x for x in (r.get("skills") or []) if isinstance(x, dict) and x.get("name")][:120]
+        roster = chr(10).join(f"- {m['name']} (agent: {m['provider']}; installed skills: " + (", ".join(x["name"] for x in sorted(m.get("skills") or [], key=lambda s: (s["name"] not in ALWAYS_SKILLS, s["name"]))[:30]) or "none") + ")" for m in p["members"])
+        self.step(p, "plan", "working", f"{self.planner_label(p)} is writing the plan")
         system = PLAN_SYSTEM.replace("{min_tasks}", str(max(n * 2, 3))).replace("{max_tasks}", str(min(MAX_TASKS, n * 6 + 2))).replace("{n}", str(n))
         user = f"PROJECT: {p['name']}\nBRIEF:\n{p['brief']}\n\nTEAM:\n{roster}\n"
+        if ctx.summary(p):
+            user += f"\nATTACHED COMPETITION CONTEXT (from the lead):\n{ctx.summary(p)}\n"
+        if p.get("answers"):
+            user += "\nTHE LEAD ANSWERED YOUR QUESTIONS:\n" + chr(10).join(f"- {a['q']} -> {a['a']}" for a in p["answers"]) + "\n"
         if p.get("user_test_cmds"):
             user += "\nThe lead requires these verification commands: " + "; ".join(p["user_test_cmds"]) + "\n"
         if p.get("feedback"):
@@ -688,7 +967,10 @@ class ProjectEngine:
                 feedback = f"\n\nYour previous reply was rejected: {e}. Fix exactly that and reply with ONLY the JSON object."
                 self.log(p, "plan", f"plan rejected: {clip(str(e), 200)}")
         if plan is None:
+            self.step(p, "plan", "failed")
             raise PlanError("the planner could not produce a valid plan after 3 attempts; adjust the brief and re-plan")
+        self.step(p, "plan", "done", f"{len(plan['tasks'])} tasks")
+        self.step(p, "check", "working")
         if p.get("user_test_cmds"):
             plan["test_cmds"] = p["user_test_cmds"]
         if not plan["test_cmds"]:
@@ -700,6 +982,7 @@ class ProjectEngine:
         p["tasks"] = plan["tasks"]
         p["contract_sha"] = hashlib.sha256(json.dumps(plan["contract_files"], sort_keys=True).encode()).hexdigest()
         p["status"], p["phase"], p["note"] = "plan_ready", "plan", "Review the plan, then approve it."
+        self.step(p, "check", "done", "Plan is consistent")
         self.log(p, "phase", f"plan ready: {len(plan['tasks'])} tasks for {n} teammates")
         if p.get("auto_approve_plan"):
             self.start(p)
@@ -731,8 +1014,8 @@ class ProjectEngine:
     async def ensure_submitted(self, s, phrase: str) -> None:
         """A TUI that is still loading (MCP servers, update checks) can swallow the Enter that follows a typed prompt, leaving the text sitting
         in its input box. If the agent shows no activity and our text is still on screen, press Enter again (an empty submit is harmless)."""
-        for _ in range(4):
-            await asyncio.sleep(7.0)
+        for i in range(5):
+            await asyncio.sleep(2.5 if i == 0 else 5.0)
             if s.state != "live":
                 return
             if time.time() - s.last_out < 3.0:
@@ -774,7 +1057,7 @@ class ProjectEngine:
             return "error"                                         # the supervisor model failed recently: use the fixed rules for a while
         self.sup_calls[p["id"]] = self.sup_calls.get(p["id"], 0) + 1
         try:
-            res = await asyncio.wait_for(self.client(p).complete(SUP_SYSTEM, f"AGENT: {s.label}\nTASK: {t['id']} {t['title']}\nCONTEXT: {why or 'screen looks static'}\n\nTERMINAL (latest text, spaces may be missing):\n{tail[-1800:]}", max_tokens=300), 75)
+            res = await asyncio.wait_for(self.client(p, "supervisor").complete(SUP_SYSTEM, f"AGENT: {s.label}\nTASK: {t['id']} {t['title']}\nCONTEXT: {why or 'screen looks static'}\n\nTERMINAL (latest text, spaces may be missing):\n{tail[-1800:]}", max_tokens=300), 75)
             d = extract_json(res.text)
         except Exception as e:                                         # a failed consult must never freeze the build: fall back to the fixed rules
             self.sup_down[p["id"]] = time.time() + 300
@@ -824,9 +1107,178 @@ class ProjectEngine:
     async def type_line(self, s, text: str) -> None:
         await self.hub.ensure_copilot(s)
         await self.hub.lead_input(self.hub.orch.actor, s, text, label="project")
-        await asyncio.sleep(0.6)
+        await asyncio.sleep(0.25)
         await self.hub.lead_input(self.hub.orch.actor, s, "\r", label="project")
 
+    def agent_busy(self, s) -> bool:
+        """True while the agent is visibly working (spinner, 'esc to interrupt') or printed something a moment ago."""
+        return bool(s and s.state == "live" and (time.time() - s.last_out < 2.5 or BUSY_RX.search(self.screen(s, 500))))
+
+    def last_line(self, s) -> str:
+        for ln in reversed(self.screen(s, 900).splitlines()):
+            ln = ln.strip(" \u2502|>\u203a\u276f")
+            if len(ln) >= 6 and not re.fullmatch(r"[\W_]+", ln):
+                return clip(ln, 140)
+        return ""
+
+    async def send_prompt(self, s, text: str, key: str, wait: float = 0.0) -> bool:
+        """Type a message into an agent only when it is idle, and never while a copy of it still sits unsent or queued in its input box.
+        (Typing into a busy agent queues the message; typing the same reminder again then sends it twice and costs tokens.)"""
+        end = time.time() + wait
+        while self.agent_busy(s):
+            if time.time() >= end:
+                return False
+            await asyncio.sleep(1.0)
+        if re.sub(r"\s+", "", key).lower() in re.sub(r"\s+", "", self.screen(s, 700)).lower():
+            return False                                                     # already on screen: waiting to be read, do not repeat it
+        await self.type_line(s, text)
+        return True
+
+    # ───────────── choosing who does what ─────────────
+    def member_stats(self, p: dict) -> dict:
+        out = {}
+        for m in p["members"]:
+            mine = [t for t in p["tasks"] if t["owner"] == m["node_id"]]
+            done = [t for t in mine if t["status"] == "merged" and t.get("started") and t.get("done_at") and not t.get("skipped")]
+            secs = [t["done_at"] - t["started"] for t in done]
+            closed = [t for t in mine if t["status"] in ("merged", "blocked")]
+            bad = [t for t in closed if t.get("restarts") or t.get("attempts") or t.get("violations") or t.get("skipped") or t["status"] == "blocked"]
+            prior = (self.memory().get("agents") or {}).get(m["provider"]) or {}
+            prec = (1 - len(bad) / len(closed)) if closed else ((prior["clean"] / prior["tasks"]) if prior.get("tasks", 0) >= 3 else None)      # past hackathons are the prior until this one has history
+            out[m["node_id"]] = {"avg": sum(secs) / len(secs) if secs else (prior.get("secs", 0) / prior["tasks"] if prior.get("tasks", 0) >= 3 and prior.get("secs") else None), "precision": prec,
+                                 "load": sum(t["weight"] for t in mine if t["status"] not in ("merged", "cancelled")), "done": len(done)}
+        return out
+
+    def pick_owner(self, p: dict, prefer: str = "", exclude=()) -> tuple:
+        """The Brain's choice of who gets a task, from facts: how precise (little rework) and how fast each laptop has been, and how busy it is now."""
+        st = self.member_stats(p)
+        cands = [m for m in p["members"] if m["node_id"] not in exclude and self.node_ok(m["node_id"])] or [m for m in p["members"] if m["node_id"] not in exclude] or p["members"]
+        avgs = [v["avg"] for v in st.values() if v["avg"]]
+        fastest = min(avgs) if avgs else None
+
+        def score(m):
+            v = st[m["node_id"]]
+            prec = v["precision"] if v["precision"] is not None else 0.8
+            speed = (fastest / v["avg"]) if (fastest and v["avg"]) else 0.7
+            return 0.55 * prec + 0.30 * speed - 0.08 * v["load"] + (0.08 if m["node_id"] == prefer else 0.0)
+        best = max(cands, key=score)
+        v = st[best["node_id"]]
+        why = (f"{best['name']}: " + (f"{int(v['precision'] * 100)}% first-time-right" if v["precision"] is not None else "no history yet") +
+               (f", {max(1, int(v['avg'] // 60))} min per task" if v["avg"] else "") + f", {v['load']} open task weight")
+        return best["node_id"], why
+
+    def backups_for(self, p: dict, m: dict, tried: list) -> list:
+        """Other agents on the same laptop that can take over, in the order the lead chose (project backup list), then the built-in order."""
+        n = self.hub.nodes.get(m["node_id"])
+        have = {x.get("id"): x for x in (n.providers if n else []) if x.get("available") and x.get("signed_in") is not False}
+        order = list(p.get("backup") or []) + list(BACKUP_ORDER)
+        allowed = set(m.get("pool") or []) or set(have)
+        return [x for x in dict.fromkeys(order) if x in have and x not in tried and x not in ("shell", "demo-agent") and x in (allowed | set(p.get("backup") or []))]
+
+    async def reset_task(self, p: dict, t: dict, why: str) -> None:
+        """Retry: stop the agent, keep the branch and its commits, and start a fresh agent on it."""
+        o = self.hub.sessions.get(t.get("sid", ""))
+        if o and o.state in ("live", "starting"):
+            await self.hub.stop_session(o.sid, "orchestrator")
+        ms = (p.get("msess") or {}).get(t["owner"])
+        if ms and ms.get("sid") == t.get("sid"):
+            ms["tasks"] = self.cfg("reuse", MAX_REUSE)                                         # never reuse a session that was just stopped for trouble
+        t.update({"status": "pending", "sid": "", "restarts": t.get("restarts", 0) + 1, "nudges": 0, "attempts": 0, "last_progress": time.time(), "nudge_at": time.time(), "retry_at": 0})
+        p["cards"] = [c for c in p.get("cards", []) if c.get("task") != t["id"]]
+        self.log(p, "task", f"{t['id']}: restarting with a fresh agent ({why})", t["id"])
+        self.save(p)
+
+    async def skip_task(self, p: dict, t: dict) -> None:
+        o = self.hub.sessions.get(t.get("sid", ""))
+        if o and o.state in ("live", "starting"):
+            await self.hub.stop_session(o.sid, "orchestrator")
+        t["status"], t["skipped"], t["done_at"] = "merged", True, time.time()
+        p["cards"] = [c for c in p.get("cards", []) if c.get("task") != t["id"]]
+        self.log(p, "task", f"{t['id']}: skipped by the lead; dependants may proceed", t["id"])
+        self.save(p)
+
+    async def failover(self, p: dict, t: dict, m: dict, why: str) -> bool:
+        """The agent is out of quota or broken: switch this task to another agent on the same laptop, else to another teammate. True if switched."""
+        cur = t.get("provider") or m["provider"]
+        tried = t.setdefault("tried", [cur])
+        if cur not in tried:
+            tried.append(cur)
+        nxt = next(iter(self.backups_for(p, m, tried)), "")
+        if nxt:
+            t["provider"], t["switched"] = nxt, True
+            tried.append(nxt)
+            self.log(p, "failover", f"{t['id']}: {cur} {why}; continuing with {nxt} on {m['name']}'s laptop (same branch, work kept)", t["id"])
+            self.notify(p, "warn", f"{cur} on {m['name']}'s laptop {why}. Switched {t['id']} to {nxt}.")
+            await self.reset_task(p, t, f"{cur} {why}")
+            return True
+        others = [x for x in p["members"] if x["node_id"] != t["owner"] and self.node_ok(x["node_id"])]
+        if others and t.get("handoffs", 0) < 2:
+            nid, reason = self.pick_owner(p, exclude={t["owner"]})
+            t["handoffs"] = t.get("handoffs", 0) + 1
+            t["owner"], t["provider"], t["tried"], t["switched"] = nid, None, [], True
+            self.log(p, "failover", f"{t['id']}: no other agent available on {m['name']}'s laptop; handing the task to {self.node_name(nid)} ({reason})", t["id"])
+            self.notify(p, "warn", f"{cur} {why} and has no backup. {t['id']} moved to {self.node_name(nid)}.")
+            await self.reset_task(p, t, f"{cur} {why}")
+            return True
+        if not any(c.get("task") == t["id"] and c["kind"] == "blocked" for c in p.get("cards", [])):
+            self.card(p, "blocked", f"{cur} {why} on {m['name']}'s laptop and no other agent could take {t['id']} ({t['title']}). Add another signed-in agent, or press Retry later.", task=t["id"], sid=t.get("sid", ""))
+        return False
+
+    def notify(self, p: dict, level: str, text: str) -> None:
+        """A message the lead should see even if the tab is in the background (the console shows it as a toast, a desktop notification and a webhook ping)."""
+        fn = getattr(self.hub, "notice", None)
+        if fn:
+            fn(level, f"[{p['name']}] {text}", p["id"])
+
+    STUCK_SYSTEM = """You are the tech lead supervising AI coding agents that build one project. A task has made no progress for a while.
+Choose the cheapest action that can unblock it. Reply with ONLY one JSON object:
+{"action": "nudge" | "restart" | "switch_agent" | "reassign" | "accept" | "wait" | "ask_human", "message": "...", "to": "teammate name", "reason": "one sentence"}
+nudge = type a short precise instruction into the running agent (message required, under 300 characters, say exactly what is missing).
+restart = stop it and start a fresh agent of the same kind on the same branch. switch_agent = another agent on the same laptop takes over (broken, looping, rate limited).
+reassign = another teammate takes the task ("to" required). accept = merge what is committed (only if the work is essentially complete).
+wait = it is probably just slow. ask_human = only if nothing above can help."""
+
+    async def decide_stuck(self, p: dict, t: dict, force: bool = False) -> None:
+        """The planner decides what to do about a stuck task, with the task, its git state, the agent's screen and each teammate's track record in front of it."""
+        m = self.member(p, t["owner"])
+        s = self.hub.sessions.get(t.get("sid", ""))
+        t["decisions"], t["decided_at"] = t.get("decisions", 0) + 1, time.time()
+        gs = await self.op(m["node_id"], "git_status", 60, dir=self.mdir(p, m), base=p["base"], branch=t["branch"])
+        st = self.member_stats(p)
+        nl = chr(10)
+        team = nl.join(f"- {x['name']} ({x['provider']}): " + (f"{int((st[x['node_id']]['precision'] or 0) * 100)}% first-time-right, " if st[x['node_id']]['precision'] is not None else "") +
+                       f"{st[x['node_id']]['load']} open, {'online' if self.node_ok(x['node_id']) else 'OFFLINE'}" for x in p["members"])
+        recent = nl.join(l["text"] for l in p.get("log", []) if l.get("task") == t["id"])[-900:]
+        quiet_min = int((time.time() - t.get("last_progress", time.time())) / 60)
+        user = (f"TASK {t['id']}: {t['title']}" + nl + t["description"][:600] + nl + f"Owner: {m['name']} using {t.get('provider') or m['provider']}; restarts so far {t.get('restarts', 0)}; reminders sent {t['nudges']}" + nl +
+                f"Quiet for {quiet_min} minutes. Commits {gs.get('ahead', '?')}, uncommitted changes {gs.get('dirty', '?')}, pushed {gs.get('pushed', '?')}." + nl * 2 +
+                "AGENT SCREEN (tail):" + nl + (self.screen(s, 1100) if s else "(no session)") + nl * 2 + "WHAT HAPPENED ON THIS TASK:" + nl + recent + nl * 2 + "TEAM:" + nl + team + nl)
+        try:
+            res = await asyncio.wait_for(self.client(p, "decisions").complete(self.STUCK_SYSTEM, user, max_tokens=500), 240)
+            d = extract_json(res.text)
+        except Exception as e:
+            d = {"action": "restart" if t.get("restarts", 0) < 2 else "ask_human", "reason": f"the planner could not be asked ({type(e).__name__})"}
+        act = str(d.get("action", "wait"))
+        why = clip(str(d.get("reason", "")), 200)
+        self.log(p, "decision", f"{t['id']}: planner decided '{act}'. {why}", t["id"])
+        if act == "nudge" and s and s.state == "live" and d.get("message"):
+            if await self.send_prompt(s, clip(str(d["message"]), 300), clip(str(d["message"]), 24), wait=30):
+                asyncio.create_task(self.ensure_submitted(s, clip(str(d["message"]), 24)))
+        elif act == "restart":
+            await self.reset_task(p, t, "planner decision")
+        elif act == "switch_agent":
+            await self.failover(p, t, m, "was judged stuck by the planner")
+        elif act == "reassign":
+            target = next((x for x in p["members"] if x["name"].lower() == str(d.get("to", "")).lower() and x["node_id"] != t["owner"]), None)
+            nid = target["node_id"] if target else self.pick_owner(p, exclude={t["owner"]})[0]
+            t["owner"], t["provider"], t["tried"] = nid, None, []
+            await self.reset_task(p, t, f"planner moved it to {self.node_name(nid)}")
+        elif act == "accept" and gs.get("ok") and gs.get("ahead", 0) >= 1:
+            await self.complete_task(p, t, m, self.mdir(p, m), gs)
+        elif act == "ask_human" or force:
+            if not any(c.get("task") == t["id"] and c["kind"] == "stalled" for c in p.get("cards", [])):
+                self.card(p, "stalled", f"Task {t['id']} ({t['title']}) is stuck. Planner's view: {why or 'it could not find a safe fix'}", task=t["id"], sid=t.get("sid", ""))
+        self.save(p)
     # ───────────── run ─────────────
     async def run(self, p: dict) -> None:
         for t in p["tasks"]:
@@ -843,6 +1295,7 @@ class ProjectEngine:
             await self.net_retry(p, "setup", lambda: self.bootstrap(p))
         while True:
             if p["phase"] == "build":
+                p["now"] = None
                 await self.build(p)
                 if p["status"] != "running":
                     return
@@ -855,9 +1308,9 @@ class ProjectEngine:
                 if ok:
                     p["phase"] = "polish"
                     self.log(p, "phase", "verification passed: final quality review")
-                elif p["round"] >= MAX_FIX_ROUNDS:
+                elif p["round"] >= self.cfg("max_fix_rounds", MAX_FIX_ROUNDS):
                     p["status"], p["phase"] = "failed", "done"
-                    p["error"] = f"verification still fails after {MAX_FIX_ROUNDS} fix rounds"
+                    p["error"] = f"verification still fails after {self.cfg("max_fix_rounds", MAX_FIX_ROUNDS)} fix rounds"
                     self.log(p, "error", p["error"])
                     await self.finish(p, failed=True)
                     return
@@ -880,7 +1333,10 @@ class ProjectEngine:
                     p["phase"] = "build"
                     continue
                 await self.net_retry(p, "submission write-up", lambda: self.submission_pack(p))
-                await self.net_retry(p, "final report", lambda: self.finish(p))
+                if p.get("review") == "auto":
+                    await self.net_retry(p, "final report", lambda: self.finalize(p))
+                else:
+                    await self.net_retry(p, "review report", lambda: self.prepare_review(p))
                 return
 
     async def check_agent(self, p: dict, m: dict) -> None:
@@ -947,6 +1403,7 @@ class ProjectEngine:
 
     async def bootstrap(self, p: dict) -> None:
         p["phase"] = "bootstrap"
+        self.now(p, "Checking git, the GitHub CLI and the agents on every laptop", "Nothing is built yet: this makes sure every laptop can clone, commit and push")
         self.log(p, "phase", "preflight: checking git and GitHub CLI on every laptop")
         pre = {}
         for m in p["members"]:
@@ -966,6 +1423,7 @@ class ProjectEngine:
         coord = (host_first or p["members"])[0]                            # the lead's own PC coordinates when it is on the team: contract, merges and the final commits are the lead's
         p["coordinator"] = coord["node_id"]
         cn = coord["node_id"]
+        self.now(p, "Creating the repository and giving every teammate push access", "Teammates get an invitation that their laptop accepts automatically")
         if not p["repo"]:
             r = await self.must(p, cn, "repo_create", 120, forge=p["forge"], repo_name=p["repo_name"], visibility=p["visibility"], path=f"kode/{p['slug']}/remote.git", base=p["base"], description=clip(p["brief"], 120))
             p["repo"] = r["repo"]
@@ -974,6 +1432,7 @@ class ProjectEngine:
             await self.net_retry(p, "repository access", lambda: self.grant_access(p))
         r = await self.must(p, cn, "git_prepare", 180, dir=self.cdir(p), repo=p["repo"], base=p["base"], forge=p["forge"])
         p["base_sha"] = r["head"]
+        self.now(p, "Freezing the contract and pushing the plan", "From now on nobody may change the shared interface")
         files = dict(p["plan"]["contract_files"])
         files["PLAN.md"] = self.render_plan_md(p)
         rules = render_rules(p)
@@ -1042,16 +1501,23 @@ class ProjectEngine:
     async def start_task(self, p: dict, t: dict) -> None:
         m = self.member(p, t["owner"])
         nid, d = m["node_id"], self.mdir(p, m)
+        prov = t.get("provider") or m["provider"]                         # a task can run on a backup agent after a failover
+        t["agent"] = prov
         branch = f"kode/{t['id'].lower()}-{slug(t['title'], 24)}" + (f"-r{t['round']}" if t.get("round") else "")
         t["branch"] = branch
-        self.log(p, "task", f"{t['id']} '{t['title']}' -> {m['name']} ({m['provider']}) on branch {branch}", t["id"])
+        self.log(p, "task", f"{t['id']} '{t['title']}' -> {m['name']} ({prov}) on branch {branch}", t["id"])
         await self.must(p, nid, "git_prepare", 180, dir=d, repo=p["repo"], base=p["base"], branch=branch, forge=p["forge"], resume=bool(t.get("attempts") or t.get("restarts")))
+        if p.get("context"):
+            sig = ",".join(x["id"] for x in p["context"])
+            if p.setdefault("ctx_sent", {}).get(nid) != sig:
+                await self.must(p, nid, "write_context", 120, dir=d, files=ctx.files_payload(p))
+                p["ctx_sent"][nid] = sig
         await self.must(p, nid, "write_task", 30, dir=d, fname="TASK.md", content=render_task(p, t, branch, p.get("contract_paths", []), m.get("skills")))
         from hub.apiprofiles import project_args
         ms = p.setdefault("msess", {}).get(nid) or {}
         cur = self.hub.sessions.get(ms.get("sid", ""))
         again = bool(t.get("attempts") or t.get("restarts"))             # a retried or restarted task gets a fresh agent; a stuck one is not reused
-        reuse = cur if (cur and cur.state == "live" and not again and ms.get("tasks", 0) < MAX_REUSE and ms.get("dir") == d and ms.get("provider") == m["provider"]) else None
+        reuse = cur if (cur and cur.state == "live" and not again and ms.get("tasks", 0) < self.cfg("reuse", MAX_REUSE) and ms.get("dir") == d and ms.get("provider") == prov) else None
         if reuse is None:
             stopped = False
             for sid0 in {t.get("sid", ""), ms.get("sid", "")} - {""}:
@@ -1061,31 +1527,39 @@ class ProjectEngine:
                     stopped = True
             if stopped:
                 await asyncio.sleep(1.0)
-            sid = await self.hub.start_session(nid, m["provider"], d, "orchestrator", profile_id=m.get("profile_id", ""), model=m.get("model", ""),
-                                               extra_args=project_args(m["provider"], p["permissions"] in ("auto", "turbo"), p["permissions"] == "turbo", resume=bool(t.get("restarts"))))
+            sid = await self.hub.start_session(nid, prov, d, "orchestrator", profile_id=m.get("profile_id", "") if prov == m["provider"] else "", model=m.get("model", "") if prov == m["provider"] else "",
+                                               extra_args=project_args(prov, p["permissions"] in ("auto", "turbo"), p["permissions"] == "turbo", resume=bool(t.get("restarts")) and not t.pop("switched", False)))
             if not sid:
-                raise RuntimeError(f"could not start {m['provider']} on {m['name']}'s laptop")
+                raise RuntimeError(f"could not start {prov} on {m['name']}'s laptop")
             t["sid"] = sid
             s = self.hub.sessions[sid]
             for _ in range(120):                                              # wait for the session to come up and the TUI banner to settle
                 await asyncio.sleep(0.5)
                 if s.state in ("error", "exited", "offline"):
-                    raise RuntimeError(f"{m['provider']} failed to start: {s.error or s.state}")
-                if s.state == "live" and time.time() - s.last_out > 2.5 and s.bytes_out > 0:
+                    raise RuntimeError(f"{prov} failed to start: {s.error or s.state}")
+                if s.state == "live" and time.time() - s.last_out > 1.5 and s.bytes_out > 0:
                     break
             await self.settle_prompts(p, t, s)
-            p["msess"][nid] = {"sid": sid, "tasks": 0, "dir": d, "provider": m["provider"]}
+            p["msess"][nid] = {"sid": sid, "tasks": 0, "dir": d, "provider": prov}
+            p.setdefault("sessions", []).append({"sid": sid, "node": nid, "member": m["name"], "agent": prov, "dir": d, "first_task": t["id"], "started": time.time()})
             first = f"You are a teammate on project {p['name']}. Read .kode/TASK.md and CLAUDE.md, do exactly what the task says, use your relevant skills, commit sensibly, push your branch, then print KODE_DONE and the number of commits."
         else:
             s, sid = reuse, reuse.sid
             t["sid"] = sid
             first = f"Next task for you: {t['id']} ({t['title']}). .kode/TASK.md was just replaced and the branch switched. Read it again, do exactly what it says (use your relevant skills), commit sensibly, push your branch, then print KODE_DONE and the number of commits."
-            self.log(p, "task", f"{t['id']}: reusing {m['name']}'s running agent session (task {ms.get('tasks', 0) + 1} of at most {MAX_REUSE} for it)", t["id"])
+            self.log(p, "task", f"{t['id']}: reusing {m['name']}'s running agent session (task {ms.get('tasks', 0) + 1} of at most {self.cfg("reuse", MAX_REUSE)} for it)", t["id"])
         p["msess"][nid]["tasks"] += 1
         t["mark0"] = t["prompt_mark"] = s.bytes_out                         # only text printed after this point counts as this task's progress
         t["dlg_sig"] = ""
-        await self.type_line(s, first)
-        asyncio.create_task(self.ensure_submitted(s, "Read .kode/TASK.md" if reuse is None else "Read it again"))
+        if reuse is not None:
+            if not await self.send_prompt(s, first, f"Next task for you: {t['id']}", wait=45):   # still busy: never queue a second message in its input box
+                p["msess"][nid]["tasks"] = self.cfg("reuse", MAX_REUSE)
+                await self.hub.stop_session(s.sid, "orchestrator")
+                await asyncio.sleep(1.0)
+                return await self.start_task(p, t)
+        else:
+            await self.type_line(s, first)
+        asyncio.create_task(self.ensure_submitted(s, "Read .kode/TASK.md" if reuse is None else f"Next task for you: {t['id']}"))
         t["status"], t["started"], t["last_progress"] = "running", time.time(), time.time()
         t["last_head"], t["settled"] = "", 0
         self.save(p)
@@ -1161,18 +1635,19 @@ class ProjectEngine:
         if c["kind"] == "prompt" and action in keys and s and s.state == "live":
             await self.hub.ensure_copilot(s)
             await self.hub.lead_input(self.hub.orch.actor, s, keys[action], label="project")
-        elif c["kind"] == "blocked" and action == "retry":
+        elif c["kind"] in ("blocked", "stalled", "setup", "prompt") and action in ("retry", "skip", "switch", "ask"):
             tk = next((x for x in p["tasks"] if x["id"] == c.get("task")), None)
-            if tk:
-                tk["status"], tk["attempts"] = "pending", 0
-                if tk.get("sid"):
-                    await self.hub.stop_session(tk["sid"], "orchestrator")
-                    tk["sid"] = ""
-        elif c["kind"] == "blocked" and action == "skip":
-            tk = next((x for x in p["tasks"] if x["id"] == c.get("task")), None)
-            if tk:
-                tk["status"] = "merged"                                   # lead accepts the gap; dependants may proceed
-                tk["skipped"] = True
+            if tk and action == "retry":
+                tk["tried"], tk["provider"] = [], None
+                await self.reset_task(p, tk, "retried by the lead")
+            elif tk and action == "skip":
+                await self.skip_task(p, tk)                                  # the lead accepts the gap; dependants may proceed
+            elif tk and action == "switch":
+                await self.failover(p, tk, self.member(p, tk["owner"]), "was switched by the lead")
+            elif tk and action == "ask":
+                self.drop_card(p, c["id"])
+                await self.decide_stuck(p, tk, force=True)
+                return
         self.drop_card(p, c["id"])
 
     async def tick_task(self, p: dict, t: dict) -> None:
@@ -1217,6 +1692,14 @@ class ProjectEngine:
             t["last_head"], t["last_progress"] = gs["head"], time.time()
         idle = time.time() - s.last_out if s and not dead else 999
         marker = bool(s and DONE_MARK.search(self.fresh(s, t.get("mark0", 0), 2500)))
+        busy = bool(s and not dead and self.agent_busy(s))
+        limit = bool(s and not dead and not busy and not marker and idle >= 20 and LIMIT_RX.search(self.fresh(s, t.get("mark0", 0), 700)))
+        apierr = bool(s and not dead and not busy and not marker and idle >= 90 and API_ERR.search(self.screen(s, 500)))
+        state = "ended" if dead else "limit" if limit else "api_error" if apierr else "working" if (busy or idle < 20) else "idle"
+        t["activity"] = {"state": state, "idle": int(idle) if idle < 999 else 0, "line": self.last_line(s) if (s and not dead) else "", "ts": int(time.time()), "agent": t.get("agent") or m["provider"]}
+        if limit or apierr:
+            if await self.failover(p, t, m, "hit its usage or rate limit" if limit else "keeps failing with API errors"):
+                return
         enough = gs["ahead"] >= t["min_commits"] or (marker and gs["ahead"] >= 1)
         finished = enough and (idle >= IDLE_DONE_S or (marker and idle >= MARKER_IDLE_S)) and (gs["pushed"] or idle >= IDLE_DONE_S * 2)
         if dead and not marker:
@@ -1248,9 +1731,7 @@ class ProjectEngine:
                 if not any(c.get("sid") == s.sid and c["kind"] == "blocked" for c in p.get("cards", [])):
                     self.card(p, "blocked", f"{s.label} on {self.member(p, t['owner'])['name']}'s laptop is on a file-review screen. Press Retry to restart this task in accept-edits mode, or open the console to answer it yourself.", task=t["id"], sid=s.sid)
             return
-        if (idle >= NUDGE_IDLE_S or quiet >= NUDGE_QUIET_S * 2) and quiet >= NUDGE_QUIET_S and (gs["dirty"] or not gs["pushed"] or gs["ahead"] < t["min_commits"]) and t["nudges"] < 3 and time.time() - t.get("nudge_at", 0) > 90:
-            t["nudges"] += 1
-            t["nudge_at"] = time.time()
+        if (idle >= NUDGE_IDLE_S or quiet >= NUDGE_QUIET_S * 2) and quiet >= NUDGE_QUIET_S and (gs["dirty"] or not gs["pushed"] or gs["ahead"] < t["min_commits"]) and t["nudges"] < 3 and time.time() - t.get("nudge_at", 0) > 90 and s and not dead:
             need = []
             if gs["dirty"]:
                 need.append("commit your uncommitted changes")
@@ -1258,11 +1739,18 @@ class ProjectEngine:
                 need.append("commit your work (nothing is committed yet)")
             if not gs["pushed"]:
                 need.append(f"push with: git push -u origin {t['branch']}")
-            await self.type_line(s, f"Status check from the team lead. Continue .kode/TASK.md. Still to do: {'; '.join(need) or 'finish the task'}. Then print KODE_DONE <number of commits>.")
-            asyncio.create_task(self.ensure_submitted(s, "Status check from the team lead"))
-            self.log(p, "nudge", f"{t['id']}: reminded the agent ({'; '.join(need)})", t["id"])
-        elif quiet > STALL_S and t["nudges"] >= 3 and not any(c.get("task") == t["id"] and c["kind"] == "stalled" for c in p["cards"]):
-            self.card(p, "stalled", f"Task {t['id']} ({t['title']}) has made no progress for {int(quiet / 60)} minutes. Open its console to help, or use Retry.", task=t["id"], sid=t["sid"])
+            key = f"Status check for {t['id']}"
+            if await self.send_prompt(s, f"{key} on branch {t['branch']}: {'; '.join(need) or 'finish the task'}. Then print KODE_DONE <number of commits>.", key):
+                t["nudges"] += 1
+                t["nudge_at"] = time.time()
+                asyncio.create_task(self.ensure_submitted(s, key))
+                self.log(p, "nudge", f"{t['id']}: reminded the agent ({'; '.join(need)})", t["id"])
+            else:
+                t["nudge_at"] = time.time() - 60                              # busy or the reminder is already waiting in its input box: look again in 30 s, never stack them
+        elif quiet > self.cfg("stall_min", 8) * 30 and t["nudges"] >= 2 and t.get("decisions", 0) < 3 and time.time() - t.get("decided_at", 0) > 300 and not dead:
+            await self.decide_stuck(p, t)
+        elif quiet > self.cfg("stall_min", 8) * 60 and (t["nudges"] >= 3 or t.get("decisions", 0) >= 3) and not any(c.get("task") == t["id"] and c["kind"] == "stalled" for c in p["cards"]):
+            self.card(p, "stalled", f"Task {t['id']} ({t['title']}) has made no progress for {int(quiet / 60)} minutes. Retry starts a fresh agent on the same branch, Skip accepts the gap, or ask the planner to decide.", task=t["id"], sid=t["sid"])
 
     def out_of_scope(self, p: dict, t: dict, changed: List[str]) -> List[str]:
         return [f for f in changed if not path_in_scope(f, t["files_owned"]) or any(path_in_scope(f, [c]) for c in p.get("contract_paths", []))]
@@ -1323,7 +1811,7 @@ class ProjectEngine:
         if t.get("sid"):
             ms = p.get("msess", {}).get(nid, {})
             more = any(x["owner"] == nid and x is not t and x["status"] not in ("merged", "cancelled") for x in p["tasks"])
-            if not (more and ms.get("sid") == t["sid"] and ms.get("tasks", 0) < MAX_REUSE and p["status"] == "running"):
+            if not (more and ms.get("sid") == t["sid"] and ms.get("tasks", 0) < self.cfg("reuse", MAX_REUSE) and p["status"] == "running"):
                 await self.hub.stop_session(t["sid"], "orchestrator")          # nothing more for this teammate: end the session
                 self.retire(t["sid"])
         self.log(p, "merge", f"{t['id']} merged into {p['base']} ({gs['ahead']} commits by {m['name']})", t["id"])
@@ -1334,7 +1822,10 @@ class ProjectEngine:
         cn, d = p["coordinator"], self.cdir(p)
         await self.must(p, cn, "git_prepare", 180, dir=d, repo=p["repo"], base=p["base"], forge=p["forge"])
         results = []
-        for cmd in p["plan"].get("setup_cmds", []) + p["plan"]["test_cmds"]:
+        cmds = p["plan"].get("setup_cmds", []) + p["plan"]["test_cmds"]
+        for i, cmd in enumerate(cmds):
+            self.now(p, f"Running `{clip(cmd, 90)}` on the merged code", f"Check {i + 1} of {len(cmds)}. If it fails, the planner diagnoses it and fix tasks are given out")
+            self.save(p)
             r = await self.op(cn, "run", 420, dir=d, cmd=cmd, cmd_timeout=360)
             results.append({"cmd": cmd, "code": r.get("code", 1) if r.get("ok") else 1, "out": r.get("out", r.get("err", ""))})
             self.log(p, "verify", f"$ {cmd} -> exit {results[-1]['code']}")
@@ -1346,13 +1837,14 @@ class ProjectEngine:
 
     async def triage(self, p: dict) -> None:
         p["round"] += 1
-        self.log(p, "phase", f"verification failed: triage round {p['round']} of {MAX_FIX_ROUNDS}")
+        self.now(p, "The planner is diagnosing why verification failed", "It reads the failing output and creates the smallest fix tasks")
+        self.log(p, "phase", f"verification failed: triage round {p['round']} of {self.cfg("max_fix_rounds", MAX_FIX_ROUNDS)}")
         failing = [x for x in p["verify"]["results"] if x["code"] != 0][-1]
         files = await self.op(p["coordinator"], "files", 30, dir=self.cdir(p))
         owners = "\n".join(f"- {t['id']} ({t['title']}): {', '.join(t['files_owned'])}" for t in p["tasks"] if t.get("round", 0) == 0)
         user = (f"PROJECT: {p['name']}\nFAILED COMMAND: {failing['cmd']} (exit {failing['code']})\nOUTPUT (tail):\n{failing['out'][-3500:]}\n\n"
                 f"TASK AREAS:\n{owners}\n\nFILES IN REPO:\n" + "\n".join((files.get('files') or [])[:150]))
-        client = self.client(p)
+        client = self.client(p, "triage")
         fix, feedback = None, ""
         for _ in range(3):
             res = await client.complete(TRIAGE_SYSTEM, user + feedback, max_tokens=2500)
@@ -1381,8 +1873,9 @@ class ProjectEngine:
         load = {m["node_id"]: sum(t["weight"] for t in p["tasks"] if t["owner"] == m["node_id"]) for m in p["members"]}
         for i, ft in enumerate(fix["fix_tasks"]):
             orig = next((t for t in p["tasks"] if t["id"] == ft.get("owner_task")), None)
-            owner = orig["owner"] if orig else min(load, key=load.get)
-            load[owner] += 1
+            owner, why_owner = self.pick_owner(p, prefer=orig["owner"] if orig else "")
+            self.log(p, "decision", f"fix task {i + 1}: given to {why_owner}")
+            load[owner] = load.get(owner, 0) + 1
             tid = f"F{p['round']}-{i + 1}"
             p["tasks"].append({"id": tid, "title": clip(str(ft.get("title", "fix")), 120), "description": clip(str(ft.get("description", "")), 3000),
                                "acceptance": f"`{failing['cmd']}` passes.", "files_owned": [str(g) for g in ft["files_owned"]], "depends_on": [],
@@ -1411,6 +1904,7 @@ class ProjectEngine:
 
     async def quality_review(self, p: dict) -> bool:
         """Last gate before 'done': a hygiene audit (code) plus a strict AI review against the brief. True = clean (or rounds exhausted, notes kept)."""
+        self.now(p, "Reviewing code quality, the README and repository hygiene", "A reviewer model checks the result against your brief; findings become polish tasks")
         await self.ensure_coordinator(p)
         cn, d = p["coordinator"], self.cdir(p)
         await self.must(p, cn, "git_prepare", 180, dir=d, repo=p["repo"], base=p["base"], forge=p["forge"])
@@ -1424,7 +1918,7 @@ class ProjectEngine:
             user = (f"BRIEF:\n{p['brief']}\n\nTASKS AND ACCEPTANCE:\n{tasks}\n\nAUDIT: files={a.get('count')} tests={a.get('has_tests')} gitignore={a.get('has_gitignore')} "
                     f"license={a.get('has_license')} stray={a.get('stray')} secrets={a.get('secrets')} todos={a.get('todos')} big={a.get('big')}\n\nREADME.md:\n{a.get('readme') or '(missing)'}\n\n"
                     f"TEST RUN:\n{vt}\n\nFILES:\n" + "\n".join((a.get('files') or [])[:120]) + f"\n\nSAMPLE SOURCE:\n{samples}")
-            res = await asyncio.wait_for(self.client(p).complete(REVIEW_SYSTEM, user, max_tokens=2500), 420)
+            res = await asyncio.wait_for(self.client(p, "review").complete(REVIEW_SYSTEM, user, max_tokens=2500), 420)
             obj = extract_json(res.text)
             review_note = clip(str(obj.get("verdict", "")), 20)
             for it in (obj.get("issues") or [])[:5]:
@@ -1445,8 +1939,8 @@ class ProjectEngine:
             self.log(p, "quality", "quality review: clean")
             self.save(p)
             return True
-        if p.get("polish_round", 0) >= MAX_POLISH_ROUNDS:
-            self.log(p, "quality", f"quality review: {len(keep)} remaining note(s) after {MAX_POLISH_ROUNDS} polish rounds: " + "; ".join(k["title"] for k in keep[:4]))
+        if p.get("polish_round", 0) >= self.cfg("polish_rounds", MAX_POLISH_ROUNDS):
+            self.log(p, "quality", f"quality review: {len(keep)} remaining note(s) after {self.cfg("polish_rounds", MAX_POLISH_ROUNDS)} polish rounds: " + "; ".join(k["title"] for k in keep[:4]))
             self.save(p)
             return True
         p["polish_round"] = p.get("polish_round", 0) + 1
@@ -1456,10 +1950,9 @@ class ProjectEngine:
 
     def add_fix_tasks(self, p: dict, items: List[dict], prefix: str, rnd: int) -> None:
         """Improvement tasks go to whoever has the least work so far (the lead's PC included), each on its own disjoint files."""
-        load = {m["node_id"]: sum(t["weight"] for t in p["tasks"] if t["owner"] == m["node_id"]) for m in p["members"]}
         for i, it in enumerate(items):
-            owner = min(load, key=load.get)
-            load[owner] += 1
+            owner, why_owner = self.pick_owner(p)
+            self.log(p, "decision", f"{prefix}-{i + 1}: given to {why_owner}")
             p["tasks"].append({"id": f"{prefix}-{i + 1}", "title": it["title"], "description": it["description"], "acceptance": "A reviewer would no longer flag this.",
                                "files_owned": it["files"], "depends_on": [], "weight": 1, "owner": owner, "min_commits": 1, "status": "pending", "sid": "", "branch": "", "pr_url": "",
                                "commits": 0, "round": rnd, "attempts": 0, "violations": 0, "nudges": 0, "log": []})
@@ -1473,13 +1966,14 @@ class ProjectEngine:
             key = ("profile", m["profile_id"]) if m.get("profile_id") else ("cli", m["provider"]) if m["provider"] in ("claude", "codex") else None
             if key and key not in seen:
                 seen.add(key)
-                out.append((f"{m['provider']}" + (f" / {m['profile_id']}" if m.get("profile_id") else " (own login)"), self.member_client(p, m)))
+                out.append((f"{m['provider']}" + (f" / {m['profile_id']}" if m.get("profile_id") else " (own login)"), self.member_client(p, m, "judge")))
         if not out:
-            out.append((self.planner_label(p), self.client(p)))
+            out.append((self.planner_label(p), self.client(p, "judge")))
         return out[:3]
 
     async def judge_review(self, p: dict, rejudge: bool = False) -> bool:
         """Score the finished repository. True = done (scored, or judging unavailable); False = improvement tasks were added and the build must run again."""
+        self.now(p, "Independent judges are scoring the finished project", "Each judge scores alone and blind; the median per criterion counts")
         await self.ensure_coordinator(p)
         cn, d = p["coordinator"], self.cdir(p)
         await self.must(p, cn, "git_prepare", 180, dir=d, repo=p["repo"], base=p["base"], forge=p["forge"])
@@ -1500,7 +1994,7 @@ class ProjectEngine:
         p["judge"] = card
         self.log(p, "judge", f"score {card['overall']}/100 (grade {card['grade']})" + (f"; judges disagree on {len(card['disagreement'])} criterion/criteria" if card["disagreement"] else ""))
         self.save(p)
-        if rejudge or card["overall"] >= jd.JUDGE_PASS or p.get("judge_round", 0) >= 1:
+        if rejudge or card["overall"] >= self.cfg("judge_pass", jd.JUDGE_PASS) or p.get("judge_round", 0) >= 1:
             return True
         items = []
         for it in card["improvements"]:
@@ -1512,7 +2006,7 @@ class ProjectEngine:
         if not items:
             return True
         p["judge_round"] = p.get("judge_round", 0) + 1
-        self.log(p, "judge", f"below {jd.JUDGE_PASS}: one improvement round with {len(items[:4])} task(s) from the judges' findings")
+        self.log(p, "judge", f"below {self.cfg("judge_pass", jd.JUDGE_PASS)}: one improvement round with {len(items[:4])} task(s) from the judges' findings")
         self.add_fix_tasks(p, items[:4], f"J{p['judge_round']}", 200 + p["judge_round"])
         return False
 
@@ -1528,6 +2022,7 @@ No hype words, no invented features or statistics. Reply with the markdown only.
 
     async def submission_pack(self, p: dict) -> None:
         """docs/SUBMISSION.md: the write-up a hackathon form asks for, from the brief, the plan, the README and the judge's scorecard. Failure is not fatal."""
+        self.now(p, "Writing the submission text and demo script", "docs/SUBMISSION.md for the hackathon form")
         try:
             await self.ensure_coordinator(p)
             cn, d = p["coordinator"], self.cdir(p)
@@ -1536,7 +2031,7 @@ No hype words, no invented features or statistics. Reply with the markdown only.
             facts = (f"PROJECT: {p['name']}\nPROBLEM / BRIEF:\n{p.get('problem') or p['brief']}\n\nPLAN SUMMARY: {(p.get('plan') or {}).get('summary', '')}\nSTACK: {(p.get('plan') or {}).get('stack', '')}\n"
                      f"CHOSEN IDEA: {(p.get('ideation') or {}).get('winner_title', '-')}\n\nREADME:\n{a.get('readme', '')[:3500]}\n\nFILES:\n" + "\n".join((a.get("files") or [])[:80])
                      + (f"\n\nSELF-ASSESSMENT (automatic judge): {j.get('overall')}/100; strengths: {'; '.join(j.get('strengths', []))}" if j.get("overall") else ""))
-            res = await asyncio.wait_for(self.client(p).complete(self.SUBMISSION_SYSTEM, facts, max_tokens=2500), 420)
+            res = await asyncio.wait_for(self.client(p, "submission").complete(self.SUBMISSION_SYSTEM, facts, max_tokens=2500), 420)
             text = res.text.strip()
             if len(text) < 300:
                 return
@@ -1552,6 +2047,163 @@ No hype words, no invented features or statistics. Reply with the markdown only.
                 await self.hub.stop_session(o.sid, "orchestrator")
                 self.retire(o.sid)
 
+    # ───────────── human review, rework, finalisation ─────────────
+    async def prepare_review(self, p: dict) -> None:
+        """Verify, polish and judge are done. Show the lead what was built, what was tested and how it scored, and wait for a yes or for changes."""
+        await self.close_sessions(p)
+        self.write_handoff(p)
+        j = p.get("judge") or {}
+        q = p.get("quality") or {}
+        tasks = [{"id": t["id"], "title": t["title"], "owner": self.node_name(t["owner"]), "agent": t.get("agent", ""), "pr": t.get("pr_url", ""), "commits": t.get("commits", 0),
+                  "minutes": round((t.get("done_at", 0) - t.get("started", 0)) / 60, 1) if t.get("done_at") and t.get("started") else 0, "skipped": bool(t.get("skipped")), "files": t.get("changed", [])[:6]} for t in p["tasks"]]
+        v = p.get("verify") or {}
+        p["report"] = {"ts": time.time(), "tasks": tasks, "tests": [{"cmd": r["cmd"], "code": r["code"], "tail": str(r.get("out", ""))[-300:]} for r in v.get("results", [])], "tests_passed": bool(v.get("passed")),
+                       "judge": {"overall": j.get("overall"), "grade": j.get("grade")} if j.get("overall") is not None else None, "quality_open": q.get("issues", []),
+                       "fix_rounds": p["round"], "rework_rounds": p.get("rework_round", 0), "repo": p["repo"], "visibility": p.get("visibility"),
+                       "how_to_run": clip(((p.get("plan") or {}).get("stack") or ""), 300),
+                       "limits": ["Tests and the judge ran against the repository on the coordinator's laptop. The app was not opened in a browser and no screenshots were taken."]}
+        p["status"], p["phase"], p["note"] = "review", "review", "Your turn: read the report, then approve it or ask for changes."
+        self.log(p, "phase", "ready for your review")
+        self.notify(p, "ok", "Verify, polish and judge are done. The report is ready for your review.")
+        self.save(p)
+
+    REWORK_SYSTEM = """You are the tech lead. The team lead reviewed the finished project and asked for changes. Turn the request into the smallest set of implementation tasks.
+Reply with ONLY one JSON object:
+{"summary": "1-2 sentences", "tasks": [{"title": "...", "description": "exactly what to change and why, quoting the request", "files_owned": ["paths or globs the task may edit"],
+  "must": ["short"], "must_not": ["short"], "owner_task": "<id of the original task whose area this is, or empty>"}]}
+Rules: 1-6 tasks, files_owned disjoint between tasks, never contract files, include tests for changed behaviour, no unrelated refactors."""
+
+    async def rework(self, p: dict, text: str, ids: list) -> None:
+        p["rework_round"] = p.get("rework_round", 0) + 1
+        n = p["rework_round"]
+        await self.ensure_coordinator(p)
+        files = await self.op(p["coordinator"], "files", 30, dir=self.cdir(p))
+        areas = chr(10).join(f"- {t['id']} ({t['title']}): {', '.join(t['files_owned'])}" for t in p["tasks"] if not t.get("round"))
+        sel = chr(10).join(f"- {t['id']} {t['title']}" for t in p["tasks"] if t["id"] in ids)
+        user = (f"PROJECT: {p['name']}{chr(10)}BRIEF:{chr(10)}{p.get('problem') or p['brief']}{chr(10)}{chr(10)}THE LEAD'S REQUEST:{chr(10)}{text}{chr(10)}" +
+                (f"{chr(10)}THE LEAD POINTED AT THESE TASKS:{chr(10)}{sel}{chr(10)}" if sel else "") + f"{chr(10)}TASK AREAS:{chr(10)}{areas}{chr(10)}{chr(10)}FILES IN REPO:{chr(10)}" + chr(10).join((files.get("files") or [])[:150]))
+        client, feedback, plan = self.client(p, "rework"), "", None
+        for _ in range(3):
+            res = await client.complete(self.REWORK_SYSTEM, user + feedback, max_tokens=3000)
+            try:
+                obj = extract_json(res.text)
+                items = obj.get("tasks")
+                if not isinstance(items, list) or not (1 <= len(items) <= 6):
+                    raise PlanError("'tasks' must be 1..6 items")
+                for it in items:
+                    if not it.get("files_owned") or any(not _safe_rel(str(g).replace("*", "x")) for g in it["files_owned"]):
+                        raise PlanError("each task needs safe relative files_owned")
+                    if any(globs_overlap(g, c) for g in it["files_owned"] for c in p["contract_paths"]):
+                        raise PlanError("tasks must not edit contract files")
+                for i, a in enumerate(items):
+                    for b in items[i + 1:]:
+                        if any(globs_overlap(x, y) for x in a["files_owned"] for y in b["files_owned"]):
+                            raise PlanError("tasks must have disjoint files_owned")
+                plan = obj
+                break
+            except (LLMOutputError, PlanError, ValueError, TypeError, AttributeError) as e:
+                feedback = f"{chr(10)}{chr(10)}Your previous reply was rejected: {e}. Reply with ONLY the JSON object."
+        if plan is None:
+            raise PlanError("the planner could not turn the request into valid tasks; rephrase it and try again")
+        self.log(p, "decision", "rework plan: " + clip(str(plan.get("summary", "")), 300))
+        for i, it in enumerate(plan["tasks"]):
+            orig = next((t for t in p["tasks"] if t["id"] == it.get("owner_task")), None)
+            owner, why = self.pick_owner(p, prefer=orig["owner"] if orig else "")
+            self.log(p, "decision", f"R{n}-{i + 1}: given to {why}")
+            p["tasks"].append({"id": f"R{n}-{i + 1}", "title": clip(str(it.get("title", "change")), 120), "description": clip(str(it.get("description", "")), 3000) + chr(10) * 2 + "The lead's request: " + clip(text, 800),
+                               "acceptance": "The lead's request is satisfied and the verification commands still pass.", "files_owned": [str(g) for g in it["files_owned"]], "depends_on": [], "weight": 1,
+                               "must": [clip(str(x), 200) for x in (it.get("must") or [])][:5], "must_not": [clip(str(x), 200) for x in (it.get("must_not") or [])][:5],
+                               "owner": owner, "min_commits": 1, "status": "pending", "sid": "", "branch": "", "pr_url": "", "commits": 0, "round": 300 + n, "attempts": 0, "violations": 0, "nudges": 0, "log": []})
+        p["round"], p["polish_round"], p["judge_round"] = 0, 0, 0                                # a fresh budget for the verify, polish and judge that follow
+        p["report"] = None
+        self.start(p)
+        p["phase"] = "build"
+        self.save(p)
+
+    async def finalize(self, p: dict) -> None:
+        """The lead approved. The build scaffolding (CLAUDE.md, AGENTS.md, PLAN.md) leaves the repository; the full context goes to a handoff file instead."""
+        self.now(p, "Cleaning up the repository and closing the project", "The build scaffolding is removed; the full context goes to the handoff file")
+        self.write_handoff(p)
+        await self.ensure_coordinator(p)
+        if p["forge"] == "github" or p["forge"] == "local":
+            r = await self.op(p["coordinator"], "remove_files", 120, dir=self.cdir(p), base=p["base"], files=["CLAUDE.md", "AGENTS.md", "PLAN.md"], message="chore: remove build scaffolding (K.O.D.E.)")
+            self.log(p, "git", "removed CLAUDE.md, AGENTS.md and PLAN.md from the repository (the context is in the handoff file)" if r.get("ok") else f"could not remove the build scaffolding: {clip(r.get('err', ''), 160)}")
+        p["report"] = p.get("report")
+        await self.finish(p)
+        self.notify(p, "ok", "Project approved and finished.")
+
+    def handoff_path(self, p: dict):
+        d = ctx.DATA / re.sub(r"[^A-Za-z0-9_-]", "", p["id"])
+        d.mkdir(parents=True, exist_ok=True)
+        return d / "CONTEXT.md"
+
+    def build_handoff(self, p: dict) -> str:
+        """One file that lets any AI (or person) pick the project up: what it is, where the code is, how it was decided, what is done and what is not, and which sessions did it."""
+        nl = chr(10)
+        pl = p.get("plan") or {}
+        j = p.get("judge") or {}
+        out = [f"# {p['name']}: project context for hand-off", "",
+               "Give this file to any AI coding assistant. It describes the project, where the code is, the agreed contract, what has been done and how to continue.", "",
+               "## How to continue", f"1. Clone the repository: `git clone https://github.com/{p['repo']}.git`" if p["forge"] == "github" else f"1. Clone the repository: `git clone {p['repo']}`",
+               f"2. Install: `{'` and `'.join(pl.get('setup_cmds') or ['(nothing to install)'])}`   Verify: `{'` and `'.join(pl.get('test_cmds') or [])}`",
+               "3. Read README.md, then the contract below. The contract is the agreed interface: change it only deliberately and update every user of it.",
+               "4. Work on a branch, commit in sensible steps, run the verify command before you push.", "",
+               "## The problem and the decision", p.get("problem") or p["brief"], ""]
+        if (p.get("ideation") or {}).get("winner_title"):
+            ide = p["ideation"]
+            out += [f"Chosen idea (agent vote): **{ide['winner_title']}**", "Ballots: " + "; ".join(f"{v['voter']} voted {v['vote']}" for v in ide.get("votes", [])), ""]
+        if p.get("answers"):
+            out += ["## Answers the lead gave"] + [f"- {a['q']} -> {a['a']}" for a in p["answers"]] + [""]
+        if p.get("context"):
+            out += ["## Attached competition context", ctx.summary(p, 6000), ""]
+        out += ["## Stack", pl.get("stack", ""), "", "## Summary", pl.get("summary", ""), "", "## Frozen contract (the interface everyone built against)"]
+        for path, body in (pl.get("contract_files") or {}).items():
+            out += [f"### {path}", "```", str(body), "```"]
+        out += ["", "## Tasks", "| Task | Title | Owner | Agent | Status | PR |", "|---|---|---|---|---|---|"]
+        for t in p["tasks"]:
+            out.append(f"| {t['id']} | {t['title']} | {self.node_name(t['owner'])} | {t.get('agent', '')} | {'skipped' if t.get('skipped') else t['status']} | {t.get('pr_url', '')} |")
+        out += ["", "## Decisions and incidents (newest last)"]
+        out += [f"- {l['text']}" for l in p.get("log", []) if l.get("kind") in ("decision", "failover", "triage", "judge", "quality", "plan", "ideate", "git")][-60:]
+        v = p.get("verify") or {}
+        out += ["", "## Verification", f"Passed: {v.get('passed')}"] + [f"- `{r['cmd']}` exit {r['code']}" for r in v.get("results", [])]
+        if j.get("overall") is not None:
+            out += ["", f"## Code judge: {j['overall']}/100 (grade {j.get('grade')})"] + [f"- {c['label']}: {c['score']}/10" for c in j.get("criteria", [])] + ["", "Improvements suggested:"] + [f"- {i['title']}" for i in j.get("improvements", [])]
+        skipped = [t for t in p["tasks"] if t.get("skipped")]
+        if skipped:
+            out += ["", "## Known gaps (tasks that were skipped)"] + [f"- {t['id']} {t['title']}" for t in skipped]
+        out += ["", "## Team and agent sessions (to revisit a session, open that agent in the folder shown)", "| Teammate | Agent | Session | Folder on their laptop | First task |", "|---|---|---|---|---|"]
+        for s in p.get("sessions", []):
+            out.append(f"| {s['member']} | {s['agent']} | {s['sid']} | {s['dir']} | {s['first_task']} |")
+        out += ["", "## Brain usage (planner, supervisor, judge calls; tokens are estimates where the provider reports none)", "| Purpose | Calls | Tokens in | Tokens out |", "|---|---|---|---|"]
+        for k, u in (p.get("usage") or {}).items():
+            out.append(f"| {k} | {u['calls']} | {u['in']} | {u['out']} |")
+        out += ["", "## Conventions used while building", render_rules(p)]
+        return nl.join(out) + nl
+
+    def write_handoff(self, p: dict) -> None:
+        try:
+            self.handoff_path(p).write_text(self.build_handoff(p), encoding="utf-8")
+        except Exception as e:
+            self.log(p, "warn", f"could not write the handoff file: {clip(str(e), 120)}")
+
+    def complete_hackathon(self, p: dict) -> None:
+        """The lead closes the event: what this team and these agents achieved is remembered and used as the starting point for the next one."""
+        mem = self.memory()
+        done = [t for t in p["tasks"] if t["status"] == "merged" and not t.get("skipped")]
+        for t in done:
+            a = mem.setdefault("agents", {}).setdefault(t.get("agent") or self.member(p, t["owner"])["provider"], {"tasks": 0, "clean": 0, "secs": 0})
+            a["tasks"] += 1
+            a["clean"] += 0 if (t.get("restarts") or t.get("attempts") or t.get("violations")) else 1
+            a["secs"] += int((t.get("done_at", 0) - t.get("started", 0)) or 0)
+        mem.setdefault("hackathons", []).append({"name": p["name"], "id": p["id"], "ts": int(time.time()), "repo": p.get("repo", ""), "team": [{"name": m["name"], "agent": m["provider"]} for m in p["members"]],
+                                                  "score": (p.get("judge") or {}).get("overall"), "tasks": len(done), "idea": (p.get("ideation") or {}).get("winner_title", "")})
+        mem["hackathons"] = mem["hackathons"][-30:]
+        self.jset("memory", mem)
+        p["completed"] = int(time.time())
+        self.write_handoff(p)
+        self.log(p, "done", "hackathon marked complete; the team's agents and results are remembered for the next one")
+        self.save(p)
+
     async def finish(self, p: dict, failed: bool = False) -> None:
         await self.close_sessions(p)
         cn = p["coordinator"]
@@ -1562,7 +2214,7 @@ No hype words, no invented features or statistics. Reply with the markdown only.
             a = by_email.get((m.get("git_email") or "").lower(), {})
             tasks = [t for t in p["tasks"] if t["owner"] == m["node_id"]]
             bal.append({"member": m["name"], "email": m.get("git_email", ""), "commits": a.get("commits", 0), "added": a.get("added", 0), "removed": a.get("removed", 0),
-                        "tasks": len(tasks), "merged": sum(1 for t in tasks if t["status"] == "merged"), "violations": sum(t.get("violations", 0) for t in tasks)})
+                        "tasks": len(tasks), "merged": sum(1 for t in tasks if t["status"] == "merged"), "violations": sum(t.get("violations", 0) for t in tasks), "times": a.get("times", [])})
         p["final"] = {"balance": bal, "passed": not failed, "rounds": p["round"], "finished": time.time(), "quality": p.get("quality"),
                       "judge": ({k: v for k, v in (p.get("judge") or {}).items() if k in ("overall", "grade")} or None)}
         if not failed:

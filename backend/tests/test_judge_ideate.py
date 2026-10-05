@@ -98,13 +98,16 @@ class StubEng:
     def __init__(self, team):
         self.team, self.logs = team, []
 
-    def member_client(self, p, m):
+    def member_client(self, p, m, purpose="ideas"):
         return self.team[m["node_id"]]
 
     def log(self, p, kind, text, task=""):
         self.logs.append(text)
 
     def save(self, p):
+        pass
+
+    def step(self, p, sid, state, detail=None):
         pass
 
 

@@ -139,7 +139,7 @@ async def start_project(hub, slow=2.5):
         await until(lambda: len([x for x in lead.nodes().values() if x["online"]]) == 2, 40)
         hub.hub.projects.llm_override = Plan(slow)
         members = [{"node_id": x["id"], "provider": "demo-agent"} for x in lead.nodes().values()]
-        r = await lead.call(t="project_create", name="Resilience", brief="two folders of files", forge="local", members=members, auto_approve_plan=True, permissions="turbo", planner={"kind": "default"})
+        r = await lead.call(t="project_create", review="auto", name="Resilience", brief="two folders of files", forge="local", members=members, auto_approve_plan=True, permissions="turbo", planner={"kind": "default"})
         assert r["ok"], r
         return r["id"], cfgs, {x["name"]: x["id"] for x in lead.nodes().values()}
 

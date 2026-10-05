@@ -2,6 +2,7 @@
 import { S, applyState, emit } from './store.js';
 import * as pool from './termpool.js';
 import { toast } from './components.js';
+import { onNotices } from './notify.js';
 
 let ws = null, retry = 800, n = 0, lastPong = 0, beat = null;
 const refs = new Map();
@@ -52,7 +53,8 @@ export function connect() {
       case 'suggestion': S.suggestions.unshift({ ...m, ts: Date.now() }); toast(`Lead suggests for ${m.label}: ${m.text}`); emit(); break;
       case 'pong': lastPong = Date.now(); break;
       case 'orch': S.orch = m; emit(); break;
-      case 'projects': S.projects = m.projects || []; emit(); break;
+      case 'projects': S.projects = m.projects || []; S.presets = m.presets || []; S.memory = m.memory || { hackathons: [], agents: {} }; emit(); break;
+      case 'notices': onNotices(m.items); break;
       case 'result': { const r = refs.get(m.ref); if (r) { refs.delete(m.ref); r(m); } break; }
       default: break;
     }
