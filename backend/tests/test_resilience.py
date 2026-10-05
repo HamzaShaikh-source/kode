@@ -15,7 +15,7 @@ import hub.project as hp
 from hub.project import ProjectEngine
 from llm import LLMResult
 from tests.hubkit import Console, HubServer, until
-from tests.test_project import StubHub, script, step
+from tests.test_project import README, StubHub, script, step
 
 run = asyncio.run
 win = pytest.mark.skipif(sys.platform != "win32", reason="demo fleet uses Windows shells")
@@ -121,7 +121,7 @@ def plan(slow=2.5):
     b = [step({f"b/f{i}.txt": f"b{i}\n"}, f"feat(b): file {i}") for i in range(1, 4)]
     return {"summary": "two folders", "stack": "none", "setup_cmds": [],
             "test_cmds": ["python -c \"import glob; assert len(glob.glob('a/*.txt'))==4 and len(glob.glob('b/*.txt'))==3, 'missing files'\""],
-            "contract_files": {"docs/CONTRACT.md": "# Contract\\nfolder a has 4 files, folder b has 3\\n"}, "tasks": [task(1, "folder a", ["a/**"], a), task(2, "folder b", ["b/**"], b)]}
+            "contract_files": {"README.md": README, "docs/CONTRACT.md": "# Contract\\nfolder a has 4 files, folder b has 3\\n"}, "tasks": [task(1, "folder a", ["a/**"], a), task(2, "folder b", ["b/**"], b)]}
 
 
 class Plan:

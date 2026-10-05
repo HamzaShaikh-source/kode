@@ -3,11 +3,11 @@
 **One brief. Your whole team builds it.**
 
 K.O.D.E. is a command center for teams where everyone codes with an AI agent (Claude Code, Codex, Antigravity, OpenCode, ...).
-The team lead writes one project brief. K.O.D.E. plans it, splits it fairly across the team, starts each teammate's own agent on
+The team lead writes one project brief. K.O.D.E. plans it, gives every teammate a substantial part of the work, starts each teammate's own agent on
 their own laptop, commits and pushes with each laptop's own GitHub login, merges the pull requests, runs the tests, and sends
 failures back as fix tasks until the project passes.
 
-It was built for hackathons: nobody passes prompts around by hand, everyone gets a fair share of the work and of the commits,
+It was built for hackathons: nobody passes prompts around by hand, everyone makes a real contribution (not an equal commit count; a small task is one good commit),
 and the lead sees every agent's terminal live on one screen.
 
 ---
@@ -16,7 +16,7 @@ and the lead sees every agent's terminal live on one screen.
 
 | | |
 |---|---|
-| **Projects** | Brief → plan with a frozen interface contract → tasks with disjoint file ownership → one branch and one PR per task → ordered merges → verification → automatic fix rounds. Live task lanes, commit balance per person, PR links. |
+| **Projects** | Brief → plan with a frozen interface contract → tasks with disjoint file ownership → one branch and one PR per task → ordered merges → verification → automatic fix rounds → a final quality review (README, tests, repository hygiene, an AI reviewer against your brief) that opens polish tasks until it is clean. Choose the repository name and visibility; K.O.D.E. adds every teammate as a collaborator and accepts the invitation on their laptop automatically. Live task lanes, contributions per person, PR links. |
 | **Your agents, your logins** | Each laptop runs its own Claude Code / Codex / Antigravity / OpenCode / Hermes session. Commits use that person's git identity and are pushed with their own `gh` login. The Brain never holds a GitHub token. |
 | **Join from any laptop** | The lead sends an invite link. The teammate opens it and runs one command (PowerShell on Windows, `curl | sh` on macOS/Linux). |
 | **Turbo agents** | Agents can run with every permission pre-approved (fastest), or be supervised by a model that answers their questions, or ask you. |
@@ -73,8 +73,8 @@ A full walkthrough is served by the app at **/guide**.
 └──────────────────────────────┘                └──────────────────────────────┘
 ```
 
-* `backend/hub/project.py` – the project engine: plan validation, fair assignment, branches, scope guard, PRs, merge order, verify,
-  triage, fix rounds, commit-balance report, the prompt supervisor.
+* `backend/hub/project.py` – the project engine: plan validation, weighted assignment, branches, scope guard, PRs, merge order, verify,
+  triage, fix rounds, contribution report, the final quality review, automatic collaborator access, the prompt supervisor.
 * `backend/node/ops.py` – git / `gh` / test operations a laptop runs for the engine, always inside its workspace.
 * `backend/hub/join.py` – invite links, join page, installers, agent bundle.
 * `backend/hub/gateway.py` – the WebSocket hub: machines, sessions, consoles, access ladder, audit.

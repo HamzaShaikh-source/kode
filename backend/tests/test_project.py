@@ -133,7 +133,7 @@ def test_assignment_is_fair_by_weight():
     assign_tasks(ts, ["a", "b", "c"])
     load = {m: sum(t["weight"] for t in ts if t["owner"] == m) for m in "abc"}
     assert max(load.values()) - min(load.values()) <= 1, load
-    assert all(t["min_commits"] >= 2 for t in ts)
+    assert all(t["min_commits"] == 1 for t in ts)
 
 
 # ───────────── the whole loop ─────────────
@@ -164,12 +164,15 @@ def make_plan():
          "description": "Write tests for fmt." + script([step({"tests/test_fmt.py": TEST_HEAD + "from src import fmt\n\n\nclass F(unittest.TestCase):\n    def test_money(self):\n        self.assertEqual(fmt.money(1.5), '$1.50')\n"}, "test(fmt): money"),
                                                         step({"tests/__keep__.txt": "x"}, "chore: out of scope marker")])},
         {"id": "T5", "title": "docs", "weight": 1, "files_owned": ["README.md"], "depends_on": [], "acceptance": "readme",
-         "description": "Write the README (this script also tries to break the rules)." + script([step({"README.md": "# demo\n"}, "docs: readme"), step({"src/evil.py": "print('x')\n", "docs/CONTRACT.md": "tampered\n"}, "oops: touch things I do not own")])},
+         "description": "Write the README (this script also tries to break the rules)." + script([step({"README.md": README}, "docs: readme"), step({"src/evil.py": "print('x')\n", "docs/CONTRACT.md": "tampered\n"}, "oops: touch things I do not own")])},
         {"id": "T6", "title": "main", "weight": 1, "files_owned": ["src/main.py"], "depends_on": [], "acceptance": "main",
          "description": "Write src/main.py." + script([step({"src/main.py": "from src import calc\n"}, "feat(main): import"), step({"src/main.py": "from src import calc\nprint(calc.add(1, 2))\n"}, "feat(main): print")])},
     ]
     return {"summary": "A tiny calculator library.", "stack": "python", "setup_cmds": [], "test_cmds": ["python -m unittest discover -s tests -p \"test_*.py\""],
             "contract_files": {"docs/CONTRACT.md": "# Contract\ncalc.add(a, b) -> number; calc.mul(a, b) -> number; fmt.money(x) -> '$1.50'\n"}, "tasks": t}
+
+
+README = "# Calc\n\nA tiny calculator library with a formatter.\n\n## Setup\n\nNo dependencies beyond Python 3.\n\n## Usage\n\nRun it with `python src/main.py 2 3`; import `src.calc` for add, sub and mul, and `src.fmt` to format results.\n\n## Tests\n\nRun the tests with `python -m unittest discover -s tests`.\n\n## Project structure\n\n- src/calc.py arithmetic\n- src/fmt.py formatting\n- src/main.py command line entry\n- tests/ unit tests for both modules\n"
 
 
 class ScriptedLLM:
@@ -210,7 +213,11 @@ def test_project_loop_plan_build_guard_merge_verify_fix_done(tmp_path, monkeypat
                                     auto_approve_plan=True, permissions="auto", planner={"kind": "default"})
                 assert r["ok"], r
                 pid = r["id"]
-                await until(lambda: lead.projects.get(pid, {}).get("status") in ("done", "failed"), 240, step=0.5)
+                try:
+                    await until(lambda: lead.projects.get(pid, {}).get("status") in ("done", "failed"), 240, step=0.5)
+                except AssertionError:
+                    q = lead.projects[pid]
+                    raise AssertionError((q["phase"], [x["text"] for x in q["log"][-14:]], [(t["id"], t["status"]) for t in q["tasks"]]))
                 p = lead.projects[pid]
                 assert p["status"] == "done", (p["status"], p.get("error"), [x["text"] for x in p["log"][-12:]])
                 # fair split: everyone got work and made commits
@@ -226,6 +233,7 @@ def test_project_loop_plan_build_guard_merge_verify_fix_done(tmp_path, monkeypat
                 # fix round happened because the first verification failed
                 assert p["round"] == 1 and any(t["id"].startswith("F1") for t in p["tasks"])
                 assert p["verify"]["passed"]
+                assert p["final"]["quality"]["issues"] == [] and p["final"]["quality"]["readme"] > 400      # the quality gate found nothing to fix
                 # inspect the shared remote itself
                 remote = p["repo"]
                 clone = tmp_path / "inspect"

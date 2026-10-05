@@ -32,6 +32,7 @@ from hub.protocol import ROLE_LEAD, clip, now_ms
 from llm import LLMOutputError, extract_json
 
 MAX_FIX_ROUNDS = 3
+MAX_POLISH_ROUNDS = 2
 MAX_TASKS = 40
 TICK_S = 3.0
 IDLE_DONE_S = 40.0            # agent quiet this long after pushing >= min commits => task finished (marker shortens it)
@@ -167,7 +168,7 @@ def normalize_plan(obj: dict, n_members: int) -> dict:
 
 
 def assign_tasks(tasks: List[dict], member_ids: List[str]) -> None:
-    """Weighted longest-processing-time assignment so everybody gets an equal share; stable for equal weights."""
+    """Weighted longest-processing-time assignment: everybody owns real work (not an equal commit count). Stable for equal weights."""
     load = {m: 0 for m in member_ids}
     cnt = {m: 0 for m in member_ids}
     for t in sorted(tasks, key=lambda x: (-x["weight"], x["id"])):
@@ -176,7 +177,7 @@ def assign_tasks(tasks: List[dict], member_ids: List[str]) -> None:
         load[pick] += t["weight"]
         cnt[pick] += 1
     for t in tasks:
-        t["min_commits"] = max(2, min(6, 2 * t["weight"]))
+        t["min_commits"] = 1                                   # a simple task is ONE good commit; bigger work commits as often as it needs to
 
 
 PLAN_SYSTEM = """You are the planning lead of a hackathon team. Several developers, each with their own AI coding agent on their own laptop, will build ONE
@@ -201,8 +202,19 @@ RULES
 - Keep contract files compact (about 60 lines in total) and task descriptions to 2-4 sentences each: the whole reply must stay short.
 - The project must be small enough to finish in the available time, run locally without paid services, and be verifiable by test_cmds (use only tools
   that are commonly installed: python, node/npm). The tests must really exercise the code, not just print OK.
-- Spread work so every one of the {n} teammates gets a similar amount; every task needs real commits.
+- Every one of the {n} teammates must own SUBSTANTIAL, meaningful work (a real feature or module, not busywork). Shares need not be identical.
+- The finished repository will be judged like a professional project, by engineers and by AI reviewers. Plan for that: one task owns a complete README.md
+  (what it is, features, prerequisites, setup, how to run, how to test, project structure), another owns real tests, the code is clean and consistent,
+  nothing is a placeholder, and the app runs from a fresh clone with the documented commands.
 Reply with ONLY the JSON object."""
+
+REVIEW_SYSTEM = """You are a strict senior reviewer evaluating a FINISHED hackathon project the way an experienced engineer or an AI judge would.
+You are given the brief, what each task had to deliver, a hygiene audit, the README, the tail of the passing test run and sample source files.
+Check: (1) does it satisfy the brief and every acceptance criterion; (2) README quality (purpose, setup, run, test, structure); (3) are tests meaningful;
+(4) code quality: structure, naming, dead code, duplication, error handling, no placeholders or TODOs; (5) repository hygiene; (6) would it run from a clean clone with the documented commands.
+Reply with ONLY one JSON object:
+{"verdict": "pass" | "fix", "issues": [{"title": "...", "description": "specific and actionable, naming the file", "files": ["paths a fix may edit"], "severity": "blocker" | "major" | "minor"}]}
+Only report problems the evidence shows; never invent. At most 5 issues; blockers and majors are things that would lose points in an evaluation. Never put contract files in "files"."""
 
 TRIAGE_SYSTEM = """You are the tech lead. The integrated project failed its verification commands. Decide which fix tasks are needed.
 Reply with ONE JSON object only:
@@ -220,7 +232,7 @@ These are the working conventions for everyone, including you.
 1. Your own assignment is in `.kode/TASK.md` in your working folder. Read it and the contract files it lists before writing code.
    The contract files define the shared interfaces and are frozen: do not edit them.
 2. Only create or edit the files listed as yours in TASK.md. Teammates own everything else; edits elsewhere are reverted automatically.
-3. Commit as you go: one commit per logical step with a clear message such as `feat(api): add GET /ideas`. Avoid one giant commit.
+3. Commit sensibly: a small task is one clear commit; bigger work commits at natural steps, as many as it needs. Messages like `feat(api): add GET /ideas`. No padding commits, no giant mixed ones.
 4. Work on your task branch only, never on `{p['base']}`. Push it with `git push -u origin <your-branch>` after your first commit and again at the end.
 5. Work on your own: the team lead is not available for questions during the task. If something is unclear, follow the contract and pick the simplest sensible option.
 6. When everything is committed and pushed, print one line `KODE_DONE <number of commits>` so the lead's dashboard can see that you finished.
@@ -248,7 +260,8 @@ Brief: {p['brief']}
 
 ## Git
 - Branch: `{branch}` (already checked out). Base branch: `{p['base']}`. Dependencies already merged: {deps}.
-- Commit after every logical step (at least {t['min_commits']} commits in total), push with `git push -u origin {branch}`.
+- Commit at sensible steps: one good commit for a small task, more when the work has natural stages. Push with `git push -u origin {branch}`.
+- Quality bar: this repository will be reviewed by engineers and AI reviewers. Clean code, real error handling, no placeholders or TODOs, tests that mean something.
 - When everything is committed and pushed, print exactly one line: `KODE_DONE <number of commits>` and stop.
 {('## Extra instructions' + chr(10) + t['extra']) if t.get('extra') else ''}
 """
@@ -531,11 +544,15 @@ class ProjectEngine:
             raise ValueError("no online teammate selected")
         pid = "p_" + secrets.token_hex(3)
         forge = "local" if m.get("forge") == "local" else "github"
+        rname = str(m.get("repo_name", "")).strip()
+        if rname and not re.fullmatch(r"([A-Za-z0-9][A-Za-z0-9-]{0,38}/)?[A-Za-z0-9._-]{1,100}", rname):
+            raise ValueError("repository name may only contain letters, numbers, '.', '-' and '_' (optionally owner/name)")
         p = {"id": pid, "name": name, "brief": brief, "repo": str(m.get("repo", "")).strip(), "forge": forge, "base": "main", "created": time.time(),
              "status": "draft", "phase": "plan", "members": members, "tasks": [], "plan": None, "log": [], "cards": [], "round": 0,
              "auto_approve_plan": bool(m.get("auto_approve_plan")), "permissions": m.get("permissions") if m.get("permissions") in ("ask", "auto", "turbo") else "turbo",
              "user_test_cmds": [str(c) for c in (m.get("test_cmds") or []) if str(c).strip()][:5],
-             "planner": self.parse_planner(m.get("planner"), members), "slug": f"{slug(name, 18)}-{pid[2:]}", "feedback": ""}
+             "planner": self.parse_planner(m.get("planner"), members), "slug": f"{slug(name, 18)}-{pid[2:]}", "feedback": "",
+             "repo_name": rname or slug(name, 40), "visibility": "public" if m.get("visibility") == "public" else "private", "polish_round": 0}
         self.items[pid] = p
         self.save(p)
         self.start_planning(p)
@@ -789,15 +806,24 @@ class ProjectEngine:
                 if p["status"] != "running":
                     return
                 if ok:
-                    await self.net_retry(p, "final report", lambda: self.finish(p))
-                    return
-                if p["round"] >= MAX_FIX_ROUNDS:
+                    p["phase"] = "polish"
+                    self.log(p, "phase", "verification passed: final quality review")
+                elif p["round"] >= MAX_FIX_ROUNDS:
                     p["status"], p["phase"] = "failed", "done"
                     p["error"] = f"verification still fails after {MAX_FIX_ROUNDS} fix rounds"
                     self.log(p, "error", p["error"])
                     await self.finish(p, failed=True)
                     return
-                await self.net_retry(p, "triage", lambda: self.triage(p))
+                else:
+                    await self.net_retry(p, "triage", lambda: self.triage(p))
+                    p["phase"] = "build"
+            if p["phase"] == "polish":
+                clean = await self.net_retry(p, "quality review", lambda: self.quality_review(p))
+                if p["status"] != "running":
+                    return
+                if clean:
+                    await self.net_retry(p, "final report", lambda: self.finish(p))
+                    return
                 p["phase"] = "build"
 
     async def check_agent(self, p: dict, m: dict) -> None:
@@ -809,6 +835,38 @@ class ProjectEngine:
             raise RuntimeError(f"{label} is not installed (or not on the PATH) on {m['name']}'s laptop. Install it there, then press Rescan on the Team page and resume.")
         if pr.get("signed_in") is False:
             raise RuntimeError(f"{label} is not signed in on {m['name']}'s laptop. Run it once there and sign in, then press Rescan on the Team page and resume.")
+
+    async def grant_access(self, p: dict) -> None:
+        """A private repo created by one laptop is invisible to the others, so they could not push. Make everyone a collaborator and accept for them,
+        each step run on the laptop whose own GitHub login must do it (the owner invites; every teammate accepts with their own account)."""
+        cn = p["coordinator"]
+        coord = self.member(p, cn)
+        owner = p["repo"].split("/")[0].lower()
+        host = (coord.get("gh_user") or "").lower()
+        for m in p["members"]:
+            u = (m.get("gh_user") or "").lower()
+            if m["node_id"] == cn or not u or u in (host, owner):
+                continue                                                           # the owner, or the same GitHub account: nothing to invite
+            if (await self.op(m["node_id"], "repo_access", 60, repo=p["repo"])).get("push"):
+                continue                                                           # already has write access (earlier run, org member, ...)
+            await self.must(p, cn, "collab_add", 90, repo=p["repo"], user=m["gh_user"])
+            self.log(p, "git", f"invited @{m['gh_user']} ({m['name']}) to {p['repo']} with write access")
+            for attempt in range(6):                                              # the invitation can take a moment to appear
+                r = await self.op(m["node_id"], "collab_accept", 60, repo=p["repo"])
+                if r.get("ok") and r.get("accepted"):
+                    self.log(p, "git", f"{m['name']}'s laptop accepted the invitation")
+                    break
+                if (await self.op(m["node_id"], "repo_access", 60, repo=p["repo"])).get("push"):
+                    break
+                await asyncio.sleep(3.0)
+        bad = []
+        for m in p["members"]:
+            r = await self.op(m["node_id"], "repo_access", 60, repo=p["repo"])
+            if not r.get("push"):
+                bad.append(f"{m['name']} (@{m.get('gh_user') or '?'})")
+        if bad:
+            raise RuntimeError(f"cannot push to {p['repo']}: {', '.join(bad)}. Ask the repository owner to add them as collaborators with write access, or choose another repository, then resume.")
+        self.log(p, "git", f"everyone can push to {p['repo']}")
 
     async def net_retry(self, p: dict, what: str, fn):
         """Run a project-level step; a network problem (laptop offline, GitHub unreachable) is retried with backoff instead of failing the project."""
@@ -849,9 +907,11 @@ class ProjectEngine:
         p["coordinator"] = coord["node_id"]
         cn = coord["node_id"]
         if not p["repo"]:
-            r = await self.must(p, cn, "repo_create", 120, forge=p["forge"], repo_name=p["slug"], path=f"kode/{p['slug']}/remote.git", base=p["base"], description=clip(p["brief"], 120))
+            r = await self.must(p, cn, "repo_create", 120, forge=p["forge"], repo_name=p["repo_name"], visibility=p["visibility"], path=f"kode/{p['slug']}/remote.git", base=p["base"], description=clip(p["brief"], 120))
             p["repo"] = r["repo"]
-            self.log(p, "git", f"created private repository {p['repo']}")
+            self.log(p, "git", f"created {p['visibility']} repository {p['repo']}" if p["forge"] == "github" else f"created local repository {p['repo']}")
+        if p["forge"] == "github":
+            await self.net_retry(p, "repository access", lambda: self.grant_access(p))
         r = await self.must(p, cn, "git_prepare", 180, dir=self.cdir(p), repo=p["repo"], base=p["base"], forge=p["forge"])
         p["base_sha"] = r["head"]
         files = dict(p["plan"]["contract_files"])
@@ -1080,6 +1140,8 @@ class ProjectEngine:
         marker = bool(s and DONE_MARK.search(self.screen(s, 2500)))
         enough = gs["ahead"] >= t["min_commits"] or (marker and gs["ahead"] >= 1)
         finished = enough and (idle >= IDLE_DONE_S or (marker and idle >= MARKER_IDLE_S)) and (gs["pushed"] or idle >= IDLE_DONE_S * 2)
+        if dead and not marker:
+            finished = False                                              # one commit no longer proves a task is complete: an agent that died without saying it is done gets restarted first
         if dead and gs["ahead"] >= 1 and t.get("restarts", 0) >= 2:
             finished = True                                                   # restarted twice and still short of the target: merge what exists, verification decides
         if finished or (dead and gs["ahead"] == 0 and t.get("restarts", 0) >= 2):
@@ -1113,8 +1175,8 @@ class ProjectEngine:
             need = []
             if gs["dirty"]:
                 need.append("commit your uncommitted changes")
-            if gs["ahead"] < t["min_commits"]:
-                need.append(f"make at least {t['min_commits']} separate commits (you have {gs['ahead']})")
+            if gs["ahead"] < 1:
+                need.append("commit your work (nothing is committed yet)")
             if not gs["pushed"]:
                 need.append(f"push with: git push -u origin {t['branch']}")
             await self.type_line(s, f"Status check from the team lead. Continue .kode/TASK.md. Still to do: {'; '.join(need) or 'finish the task'}. Then print KODE_DONE <number of commits>.")
@@ -1246,6 +1308,77 @@ class ProjectEngine:
                                "round": p["round"], "attempts": 0, "violations": 0, "nudges": 0, "log": []})
         self.save(p)
 
+    # ───────────── final quality review ─────────────
+    def hygiene_issues(self, a: dict) -> List[dict]:
+        out = []
+        if a.get("readme_len", 0) < 400 or not a.get("readme_has_run") or not a.get("readme_has_test"):
+            out.append({"title": "Write a complete README", "files": ["README.md"], "severity": "major",
+                        "description": "README.md is missing or too thin. Write it for a first-time visitor: what the project is and who it is for, features, prerequisites, setup, how to run it, how to run the tests, usage examples and the project structure. Use only commands that really work in this repository."})
+        if a.get("stray"):
+            out.append({"title": "Remove files that do not belong in the repository", "files": list(a["stray"])[:20], "severity": "major",
+                        "description": "These tracked files are build output, caches, logs or tool scratch and must be deleted from git: " + ", ".join(a["stray"][:20]) + ". Add matching patterns to .gitignore if it is yours to edit."})
+        if a.get("secrets"):
+            files = sorted({x.split(":")[0] for x in a["secrets"]})
+            out.append({"title": "Remove secrets from the code", "files": files[:10], "severity": "blocker",
+                        "description": "Possible secrets or keys were found at: " + ", ".join(a["secrets"]) + ". Replace them with environment variables and document them in the README."})
+        if a.get("todos"):
+            files = sorted({x.split(":")[0] for x in a["todos"]})
+            out.append({"title": "Resolve TODO / FIXME / placeholder text", "files": files[:10], "severity": "major",
+                        "description": "Finish or remove these leftovers: " + "; ".join(a["todos"][:8])})
+        return out
+
+    async def quality_review(self, p: dict) -> bool:
+        """Last gate before 'done': a hygiene audit (code) plus a strict AI review against the brief. True = clean (or rounds exhausted, notes kept)."""
+        await self.ensure_coordinator(p)
+        cn, d = p["coordinator"], self.cdir(p)
+        await self.must(p, cn, "git_prepare", 180, dir=d, repo=p["repo"], base=p["base"], forge=p["forge"])
+        a = await self.must(p, cn, "repo_audit", 120, dir=d)
+        issues = self.hygiene_issues(a)
+        review_note = ""
+        try:
+            tasks = "\n".join(f"- {t['title']}: {t.get('acceptance', '')}" for t in p["tasks"] if not t.get("round"))
+            vt = "\n".join(f"$ {x['cmd']} -> exit {x['code']}\n{x['out'][-700:]}" for x in (p.get("verify") or {}).get("results", []))
+            samples = "\n\n".join(f"--- {k} ---\n{v}" for k, v in (a.get("samples") or {}).items())
+            user = (f"BRIEF:\n{p['brief']}\n\nTASKS AND ACCEPTANCE:\n{tasks}\n\nAUDIT: files={a.get('count')} tests={a.get('has_tests')} gitignore={a.get('has_gitignore')} "
+                    f"license={a.get('has_license')} stray={a.get('stray')} secrets={a.get('secrets')} todos={a.get('todos')} big={a.get('big')}\n\nREADME.md:\n{a.get('readme') or '(missing)'}\n\n"
+                    f"TEST RUN:\n{vt}\n\nFILES:\n" + "\n".join((a.get('files') or [])[:120]) + f"\n\nSAMPLE SOURCE:\n{samples}")
+            res = await asyncio.wait_for(self.client(p).complete(REVIEW_SYSTEM, user, max_tokens=2500), 420)
+            obj = extract_json(res.text)
+            review_note = clip(str(obj.get("verdict", "")), 20)
+            for it in (obj.get("issues") or [])[:5]:
+                if not isinstance(it, dict) or str(it.get("severity", "minor")) not in ("blocker", "major"):
+                    continue
+                files = [str(f) for f in (it.get("files") or []) if _safe_rel(str(f).replace("*", "x")) and not any(globs_overlap(str(f), c) for c in p["contract_paths"])]
+                if files:
+                    issues.append({"title": clip(str(it.get("title", "Improve quality")), 100), "description": clip(str(it.get("description", "")), 1500), "files": files[:10], "severity": str(it["severity"])})
+        except Exception as e:                                                  # the model is a bonus: hygiene checks above always apply
+            self.log(p, "warn", f"AI review unavailable ({type(e).__name__}); using the automatic hygiene checks only")
+        keep: List[dict] = []
+        for it in issues:                                                       # fix tasks must own disjoint files
+            if not any(globs_overlap(x, y) for k in keep for x in k["files"] for y in it["files"]):
+                keep.append(it)
+        p["quality"] = {"round": p.get("polish_round", 0), "verdict": review_note, "issues": [{"title": k["title"], "severity": k["severity"]} for k in keep],
+                        "readme": a.get("readme_len", 0), "files": a.get("count", 0), "tests": a.get("has_tests"), "stray": len(a.get("stray") or []), "secrets": len(a.get("secrets") or [])}
+        if not keep:
+            self.log(p, "quality", "quality review: clean")
+            self.save(p)
+            return True
+        if p.get("polish_round", 0) >= MAX_POLISH_ROUNDS:
+            self.log(p, "quality", f"quality review: {len(keep)} remaining note(s) after {MAX_POLISH_ROUNDS} polish rounds: " + "; ".join(k["title"] for k in keep[:4]))
+            self.save(p)
+            return True
+        p["polish_round"] = p.get("polish_round", 0) + 1
+        self.log(p, "quality", f"quality review round {p['polish_round']}: {len(keep)} improvement task(s): " + "; ".join(k["title"] for k in keep[:4]))
+        load = {m["node_id"]: sum(t["weight"] for t in p["tasks"] if t["owner"] == m["node_id"]) for m in p["members"]}
+        for i, it in enumerate(keep[:5]):
+            owner = min(load, key=load.get)
+            load[owner] += 1
+            p["tasks"].append({"id": f"Q{p['polish_round']}-{i + 1}", "title": it["title"], "description": it["description"], "acceptance": "A reviewer would no longer flag this.",
+                               "files_owned": it["files"], "depends_on": [], "weight": 1, "owner": owner, "min_commits": 1, "status": "pending", "sid": "", "branch": "", "pr_url": "",
+                               "commits": 0, "round": 100 + p["polish_round"], "attempts": 0, "violations": 0, "nudges": 0, "log": []})
+        self.save(p)
+        return False
+
     async def finish(self, p: dict, failed: bool = False) -> None:
         cn = p["coordinator"]
         stats = await self.op(cn, "log_stats", 60, dir=self.cdir(p), base=p["base"], since=p.get("base_sha", ""))
@@ -1256,7 +1389,7 @@ class ProjectEngine:
             tasks = [t for t in p["tasks"] if t["owner"] == m["node_id"]]
             bal.append({"member": m["name"], "email": m.get("git_email", ""), "commits": a.get("commits", 0), "added": a.get("added", 0), "removed": a.get("removed", 0),
                         "tasks": len(tasks), "merged": sum(1 for t in tasks if t["status"] == "merged"), "violations": sum(t.get("violations", 0) for t in tasks)})
-        p["final"] = {"balance": bal, "passed": not failed, "rounds": p["round"], "finished": time.time()}
+        p["final"] = {"balance": bal, "passed": not failed, "rounds": p["round"], "finished": time.time(), "quality": p.get("quality")}
         if not failed:
             p["status"], p["phase"], p["note"] = "done", "done", "Project complete: all tasks merged and the verification commands pass."
             self.log(p, "done", "project complete; verification passed")

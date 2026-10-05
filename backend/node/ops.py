@@ -20,6 +20,10 @@ from typing import Any, Dict, List, Optional
 
 TAIL = 6000
 NO_WINDOW = {"creationflags": 0x08000000} if os.name == "nt" else {}      # CREATE_NO_WINDOW: helper processes must never pop up a console of their own
+STRAY = re.compile(r"(^|/)(__pycache__|node_modules|\.DS_Store|Thumbs\.db|\.kode|\.kode-planner|\.token-optimizer|\.idea|\.vscode)(/|$)|\.(log|tmp|bak|orig|swp|pyc)$|(^|/)\.env(\.|$)|(^|/)(scratch|tmp|temp)[^/]*(/|$)", re.I)
+SECRET_RX = [re.compile(p) for p in (r"AKIA[0-9A-Z]{16}", r"\bgh[opsur]_[A-Za-z0-9]{30,}", r"github_pat_[A-Za-z0-9_]{30,}", r"\bsk-[A-Za-z0-9]{32,}", r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
+                                         r"(?i)(api[_-]?key|secret|token|password)\s*[:=]\s*['\"][A-Za-z0-9_\-]{16,}['\"]")]
+TODO_RX = re.compile(r"\b(TODO|FIXME|XXX|HACK)\b|lorem ipsum|placeholder", re.I)
 EXCLUDE = ".kode/"
 LOCAL_IGNORES = [".kode/", ".kode-planner/", ".token-optimizer/"]
 
@@ -140,12 +144,98 @@ class Ops:
             await self.must(tmp, "push", "-u", "origin", base)
             shutil.rmtree(tmp, ignore_errors=True)
             return {"repo": str(bare)}
-        name = a["repo_name"]
-        r = await self.sh(["gh", "repo", "create", name, "--private", "--add-readme", "--description", a.get("description", "K.O.D.E. project")], self.roots[0], 90)
+        name = a["repo_name"]                                   # "name" (your account) or "org/name"
+        if not re.fullmatch(r"([A-Za-z0-9][A-Za-z0-9-]{0,38}/)?[A-Za-z0-9._-]{1,100}", name):
+            raise OpError("repository name may only contain letters, numbers, '.', '-' and '_' (optionally owner/name)")
+        vis = "--public" if a.get("visibility") == "public" else "--private"
+        r = await self.sh(["gh", "repo", "create", name, vis, "--add-readme", "--description", a.get("description", "K.O.D.E. project")[:300]], self.roots[0], 90)
         if r["code"] != 0:
             raise OpError("gh repo create failed: " + tail(r["out"], 600).strip())
+        if "/" in name:
+            return {"repo": name}
         who = await self.sh(["gh", "api", "user", "--jq", ".login"])
         return {"repo": f"{who['out'].strip()}/{name}"}
+
+    async def op_collab_add(self, a):
+        """Run on the REPOSITORY OWNER's laptop: give a teammate write access (GitHub sends them an invitation)."""
+        repo, user = a["repo"], a["user"]
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}", user) or not re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", repo):
+            raise OpError("bad repository or user name")
+        r = await self.sh(["gh", "api", "-X", "PUT", f"repos/{repo}/collaborators/{user}", "-f", "permission=push", "--silent"], self.roots[0], 60)
+        if r["code"] != 0:
+            raise OpError(f"could not add {user} to {repo} (the account running this needs admin rights on it): " + tail(r["out"], 300).strip())
+        return {"invited": user}
+
+    async def op_collab_accept(self, a):
+        """Run on the TEAMMATE's laptop with their own gh login: accept the pending invitation to the repository, if there is one."""
+        repo = a["repo"]
+        r = await self.sh(["gh", "api", "user/repository_invitations", "--jq", ".[] | [.id, .repository.full_name] | @tsv"], self.roots[0], 60)
+        if r["code"] != 0:
+            raise OpError("could not list repository invitations: " + tail(r["out"], 300).strip())
+        accepted = 0
+        for line in r["out"].splitlines():
+            iid, _, name = line.partition("\t")
+            if name.strip().lower() == repo.lower() and iid.strip().isdigit():
+                p = await self.sh(["gh", "api", "-X", "PATCH", f"user/repository_invitations/{iid.strip()}", "--silent"], self.roots[0], 60)
+                if p["code"] != 0:
+                    raise OpError("could not accept the invitation: " + tail(p["out"], 300).strip())
+                accepted += 1
+        return {"accepted": accepted}
+
+    async def op_repo_access(self, a):
+        """Can THIS laptop's gh account push to the repository?"""
+        r = await self.sh(["gh", "api", f"repos/{a['repo']}", "--jq", ".permissions.push"], self.roots[0], 60)
+        return {"push": r["code"] == 0 and r["out"].strip().lower() == "true", "detail": tail(r["out"], 200).strip()}
+
+    async def op_repo_audit(self, a):
+        """Hygiene audit of a checked-out repository: what a reviewer (human or AI) would flag in the first five minutes."""
+        d = self.path(a["dir"])
+        files = [l for l in (await self.git(d, "ls-files"))["out"].splitlines() if l]
+        meta = {"README.md", "CLAUDE.md", "AGENTS.md", "PLAN.md"}
+        readme = ""
+        for n in ("README.md", "Readme.md", "readme.md", "README"):
+            if (d / n).is_file():
+                readme = (d / n).read_text(encoding="utf-8", errors="replace")
+                break
+        stray = [f for f in files if STRAY.search(f.replace("\\", "/"))]
+        secrets, todos = [], []
+        text_ext = (".py", ".js", ".ts", ".tsx", ".jsx", ".html", ".css", ".md", ".json", ".yaml", ".yml", ".toml", ".txt", ".sh", ".env", ".cfg", ".ini", ".java", ".go", ".rs", ".c", ".cpp", ".h")
+        for f in files[:600]:
+            if not f.lower().endswith(text_ext) or f in meta or f.startswith("docs/CONTRACT"):
+                continue
+            try:
+                body = (d / f).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for i, line in enumerate(body.splitlines(), 1):
+                if len(secrets) < 8 and any(rx.search(line) for rx in SECRET_RX):
+                    secrets.append(f"{f}:{i}")
+                if len(todos) < 12 and TODO_RX.search(line) and not f.lower().endswith(".md"):
+                    todos.append(f"{f}:{i}: {line.strip()[:80]}")
+        big = []
+        for f in files[:600]:
+            try:
+                if (d / f).stat().st_size > 1_000_000:
+                    big.append(f)
+            except OSError:
+                pass
+        code_ext = (".py", ".js", ".ts", ".tsx", ".jsx", ".html", ".css", ".java", ".go", ".rs", ".c", ".cpp")
+        sized = []
+        for f in files[:600]:
+            if f.lower().endswith(code_ext) and f not in meta and not f.startswith(("docs/CONTRACT", "tests/", "test/")):
+                try:
+                    sized.append(((d / f).stat().st_size, f))
+                except OSError:
+                    pass
+        samples = {}
+        for _, f in sorted(sized, reverse=True)[:6]:
+            samples[f] = (d / f).read_text(encoding="utf-8", errors="replace")[:1800]
+        low = readme.lower()
+        return {"samples": samples, "files": files[:400], "readme": readme[:5000], "readme_len": len(readme.strip()),
+                "readme_has_run": any(k in low for k in ("run", "usage", "getting started", "install", "quick start")), "readme_has_test": "test" in low,
+                "stray": stray[:30], "secrets": secrets, "todos": todos, "big": big[:10],
+                "has_tests": any(re.search(r"(^|/)(tests?|__tests__|spec)(/|$)|(_test|\.test|\.spec)\.", f) for f in files),
+                "has_gitignore": ".gitignore" in files, "has_license": any(f.upper().startswith("LICENSE") for f in files), "count": len(files)}
 
     async def op_git_prepare(self, a):
         """Ensure a clone of the repo in `dir`, then check out `branch` created from origin/<base>."""

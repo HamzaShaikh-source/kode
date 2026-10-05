@@ -6,17 +6,22 @@ import * as hub from '../hubclient.js';
 
 const STATUS = { draft: ['Draft', ''], planning: ['Planning', 'info'], plan_ready: ['Plan ready', 'warn'], running: ['Running', 'accent'], paused: ['Paused', 'warn'], done: ['Done', 'ok'], failed: ['Failed', 'bad'], cancelled: ['Cancelled', ''] };
 const TASK = { pending: ['Waiting', ''], starting: ['Starting', 'info'], running: ['Building', 'accent'], review: ['Merging', 'info'], merged: ['Merged', 'ok'], blocked: ['Blocked', 'bad'], cancelled: ['Cancelled', ''] };
-const PHASES = [['plan', 'Plan'], ['bootstrap', 'Contract'], ['build', 'Build'], ['verify', 'Verify'], ['done', 'Done']];
+const PHASES = [['plan', 'Plan'], ['bootstrap', 'Contract'], ['build', 'Build'], ['verify', 'Verify'], ['polish', 'Polish'], ['done', 'Done']];
 
 export function openNewProject() {
   const nodes = S.nodes.filter((n) => n.online);
   if (!nodes.length) { toast('No teammate is online. Invite one first.', 'bad'); return; }
   const name = h('input', { id: 'np-name', type: 'text', maxlength: 60, placeholder: 'e.g. Campus event planner' });
   const brief = h('textarea', { id: 'np-brief', rows: 5, maxlength: 4000, placeholder: 'What should the team build? Include the must-have features, the stack if you care, and the demo you want to show.' });
-  const repo = h('input', { id: 'np-repo', type: 'text', placeholder: 'owner/name (leave empty to create a new private repository)', spellcheck: 'false' });
+  const repo = h('input', { id: 'np-repo', type: 'text', placeholder: 'owner/name (leave empty to create a new repository)', spellcheck: 'false' });
+  const rname = h('input', { id: 'np-rname', type: 'text', maxlength: 100, placeholder: 'defaults to the project name', spellcheck: 'false' });
+  const vis = h('select', { id: 'np-vis' }, h('option', { value: 'private' }, 'Private (only invited people)'), h('option', { value: 'public' }, 'Public (anyone can see it)'));
+  const newRepo = h('div', { class: 'grid2' }, h('label', { class: 'f', for: 'np-rname' }, 'New repository name', rname), h('label', { class: 'f', for: 'np-vis' }, 'Visibility', h('small', {}, 'Every teammate is added as a collaborator and their laptop accepts automatically.'), vis));
+  const syncRepo = () => { newRepo.style.display = forge.value === 'github' && !repo.value.trim() ? '' : 'none'; };
   const forge = h('select', { id: 'np-forge' }, h('option', { value: 'github' }, 'GitHub (each laptop uses its own gh login)'), h('option', { value: 'local' }, 'Local git folder (no GitHub, for rehearsal)'));
   const tests = h('input', { id: 'np-tests', type: 'text', placeholder: 'optional, e.g. npm test (otherwise the planner chooses)', spellcheck: 'false' });
   const picker = plannerPicker(nodes);
+  forge.addEventListener('change', syncRepo); repo.addEventListener('input', syncRepo); syncRepo();
   const auto = h('input', { type: 'checkbox', id: 'np-auto' });
   const perms = h('select', { id: 'np-perm' }, h('option', { value: 'turbo' }, 'Turbo: agents never ask for permission (fastest)'), h('option', { value: 'auto' }, 'Supervised: agents ask, the supervisor model answers'), h('option', { value: 'ask' }, 'Ask me: every agent question becomes a card'));
   const err = h('div', { class: 'field-err', role: 'alert' });
@@ -33,7 +38,8 @@ export function openNewProject() {
   const body = h('div', { style: { display: 'grid', gap: '14px' } },
     h('label', { class: 'f', for: 'np-name' }, 'Project name', name), h('label', { class: 'f', for: 'np-brief' }, 'Brief', brief),
     h('div', { class: 'f' }, 'Team and agents', h('small', {}, 'Each teammate builds with the agent you pick on their own laptop.'), h('div', { class: 'mlist' }, rows.map((r) => r.el))),
-    h('div', { class: 'grid2' }, h('label', { class: 'f', for: 'np-forge' }, 'Where the code lives', forge), h('label', { class: 'f', for: 'np-repo' }, 'Repository', repo)),
+    h('div', { class: 'grid2' }, h('label', { class: 'f', for: 'np-forge' }, 'Where the code lives', forge), h('label', { class: 'f', for: 'np-repo' }, 'Use an existing repository (optional)', repo)),
+    newRepo,
     picker.el,
     h('label', { class: 'f', for: 'np-tests' }, 'Verification command', tests),
     h('label', { class: 'f', for: 'np-perm' }, 'Agent permissions', h('small', {}, 'Turbo lets each agent run any command and edit any file inside the project folder without asking. Terms, logins and destructive prompts still stop and ask you.'), perms),
@@ -44,7 +50,7 @@ export function openNewProject() {
     try {
       if (picker.empty) throw new Error('No planner is available: log in to Claude Code or Codex on a laptop, or add an API profile on the Models page.');
       const members = rows.filter((r) => r.on.checked && r.sel.value).map((r) => ({ node_id: r.n.id, provider: r.sel.value, profile_id: r.prof.value }));
-      const r = await hub.call({ t: 'project_create', name: name.value, brief: brief.value, repo: repo.value, forge: forge.value, members, test_cmds: tests.value.trim() ? [tests.value.trim()] : [], auto_approve_plan: auto.checked, planner: picker.spec(), permissions: perms.value });
+      const r = await hub.call({ t: 'project_create', name: name.value, brief: brief.value, repo: repo.value, repo_name: rname.value.trim(), visibility: vis.value, forge: forge.value, members, test_cmds: tests.value.trim() ? [tests.value.trim()] : [], auto_approve_plan: auto.checked, planner: picker.spec(), permissions: perms.value });
       if (!r.ok) throw new Error(r.err || 'could not create');
       close(); location.hash = '#/projects/' + r.id;
     } catch (e) { setText(err, e.message); go.disabled = false; }
@@ -118,6 +124,8 @@ export function mount(root, arg) {
     if (p.tasks && p.tasks.length && p.status !== 'plan_ready') wrap.append(lanes(p));
     if (p.tasks && p.tasks.length) wrap.append(balance(p));
     if (p.verify) wrap.append(verifyCard(p));
+    const q = (p.final && p.final.quality) || p.quality;
+    if (q) wrap.append(qualityCard(p, q));
     if (p.final && p.final.passed) wrap.append(h('div', { class: 'note ok' }, h('b', {}, 'Finished. '), `All ${p.tasks.length} tasks merged and the verification commands pass${p.round ? ` after ${p.round} fix round(s)` : ''}.`));
     wrap.append(h('div', { class: 'sec-h' }, h('h2', {}, 'Activity')), h('div', { class: 'card plog' }, (p.log || []).slice().reverse().slice(0, 80).map((l) => h('div', { class: 'plog-r ' + l.kind }, h('time', {}, rel(l.ts)), h('span', {}, l.text)))));
   }
@@ -132,7 +140,7 @@ export function mount(root, arg) {
         h('div', {}, h('b', {}, 'Frozen contract'), ' (nobody may edit these): ', p.plan.contract_files.map((f) => h('code', { style: { marginRight: '6px' } }, f))),
         h('div', {}, h('b', {}, 'Verified by: '), p.plan.test_cmds.map((c) => h('code', { style: { marginRight: '6px' } }, c))),
         h('table', { class: 'table' }, h('thead', {}, h('tr', {}, ['Task', 'Owner', 'Files it owns', 'Needs'].map((x) => h('th', {}, x)))),
-          h('tbody', {}, p.tasks.map((t) => h('tr', {}, h('td', {}, h('b', {}, t.id + ' '), t.title, h('div', { class: 'faint', style: { fontSize: '12px' } }, `weight ${t.weight}, at least ${t.min_commits} commits`)), h('td', {}, own(t)), h('td', { class: 'mono', style: { fontSize: '12px' } }, t.files_owned.join(', ')), h('td', {}, t.depends_on.join(', ') || '-'))))),
+          h('tbody', {}, p.tasks.map((t) => h('tr', {}, h('td', {}, h('b', {}, t.id + ' '), t.title, h('div', { class: 'faint', style: { fontSize: '12px' } }, `weight ${t.weight}`)), h('td', {}, own(t)), h('td', { class: 'mono', style: { fontSize: '12px' } }, t.files_owned.join(', ')), h('td', {}, t.depends_on.join(', ') || '-'))))),
         rpk.el, h('div', { class: 'pplan-a' }, fb, h('button', { class: 'btn', type: 'button', onclick: () => act('project_replan', p.id, { feedback: fb.value, planner: rpk.spec() }) }, 'Re-plan'), h('button', { class: 'btn primary', type: 'button', onclick: () => act('project_approve', p.id) }, icon('play', 14), 'Approve and start building'))));
   }
 
@@ -144,7 +152,7 @@ export function mount(root, arg) {
         h('div', { class: 'lane-b' }, ts.map((t) => {
           const [ts_, tc] = TASK[t.status] || [t.status, ''];
           return h('div', { class: 'tcard ' + t.status }, h('div', { class: 'prow-t' }, h('b', {}, t.id), chip(ts_, tc), t.round ? chip('fix', 'warn') : null), h('div', {}, t.title),
-            h('div', { class: 'faint', style: { fontSize: '12px' } }, `${t.commits || 0} commits${t.min_commits ? ' of at least ' + t.min_commits : ''}${t.violations ? ', ' + t.violations + ' scope fix' : ''}`),
+            h('div', { class: 'faint', style: { fontSize: '12px' } }, `${t.commits || 0} commit${t.commits === 1 ? '' : 's'}${t.violations ? ', ' + t.violations + ' scope fix' : ''}`),
             t.wait ? h('div', { class: 'twait' }, icon('wifi', 12), t.wait + ' - retrying automatically') : null,
             h('div', { class: 'tcard-a' }, t.sid && ['running', 'starting', 'review'].includes(t.status) ? h('a', { class: 'btn sm', href: '#/session/' + t.sid }, icon('terminal', 12), 'Console') : null,
               t.pr_url && t.pr_url.startsWith('http') ? h('a', { class: 'btn sm', href: t.pr_url, target: '_blank', rel: 'noopener' }, 'PR') : null));
@@ -159,8 +167,17 @@ export function mount(root, arg) {
       return { name: m.name, commits, lines: fin ? fin.added : p.tasks.filter((t) => t.owner === m.node_id).reduce((a, t) => a + (t.added || 0), 0) };
     });
     const max = Math.max(1, ...rows.map((r) => r.commits));
-    return h('div', {}, h('div', { class: 'sec-h' }, h('h2', {}, 'Commit balance'), h('p', {}, p.final ? 'Final, from git history' : 'Live, from each laptop\'s branch')),
+    return h('div', {}, h('div', { class: 'sec-h' }, h('h2', {}, 'Contributions'), h('p', {}, p.final ? 'Final, from git history' : 'Live, from each laptop\'s branch')),
       h('div', { class: 'card card-b', style: { display: 'grid', gap: '12px' } }, rows.map((r) => h('div', {}, h('div', { class: 'orow' }, h('b', {}, r.name), h('span', { class: 'mono' }, `${r.commits} commits, ${fmtNum(r.lines)} lines added`)), h('div', { class: 'bar' }, h('i', { style: { width: Math.max(2, (r.commits / max) * 100) + '%' } }))))));
+  }
+
+  function qualityCard(p, q) {
+    const open = q.issues || [];
+    const facts = [['README', q.readme ? q.readme + ' chars' : 'missing'], ['Tests', q.tests ? 'present' : 'none found'], ['Stray files', String(q.stray || 0)], ['Secrets', String(q.secrets || 0)], ['Files', String(q.files || 0)]];
+    return h('div', {}, h('div', { class: 'sec-h' }, h('h2', {}, 'Quality review'), h('p', {}, (open.length ? open.length + ' open note' + (open.length === 1 ? '' : 's') : 'Clean') + (q.round ? `, after ${q.round} polish round${q.round === 1 ? '' : 's'}` : ''))),
+      h('div', { class: 'card card-b', style: { display: 'grid', gap: '10px' } },
+        h('div', { class: 'prow-t' }, facts.map(([k, v]) => chip(k + ': ' + v, 'ok'))),
+        open.length ? h('ul', { class: 'muted' }, open.map((i) => h('li', {}, h('b', {}, i.severity + ': '), i.title))) : h('p', { class: 'muted' }, 'The README, tests and repository hygiene were checked and a reviewer model found nothing to fix.')));
   }
 
   function verifyCard(p) {

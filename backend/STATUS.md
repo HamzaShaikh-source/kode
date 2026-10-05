@@ -147,3 +147,10 @@ Causes: the agent reported providers only at connect time (and a running Windows
 Fixes: 15 s rescan with PATH refresh (registry + common folders), `providers` update message, Rescan button, signed-in check (Claude `auth status`, Codex `login status`; others unknown), pre-flight error before a project starts; a fresh invite always re-pairs, a bad invite falls back to the saved login, and the old offline entry for the same person/machine is replaced.
 Tests (`test_resilience.py`): tool appearing after start without restart (real node process), stale token + new invite, bad invite + good saved login, rejoin leaves one entry. Not verified: Antigravity sign-in state (it has no cheap status command, shown as unknown).
 Windows Defender finding: the one-liner `powershell -ExecutionPolicy Bypass -Command "irm <url> | iex"` was BLOCKED by Defender on this PC (Get-MpThreatDetection shows the command line; CreateProcess returns Access denied), after working earlier. The Windows join flow now uses a downloaded `kode-join.ps1` (BOM + CRLF) run with `-File`; verified end to end over the LAN address with a stale saved login present (joined in 30 s, registration replaced). Defender settings were not changed.
+
+## Repository access, contributions and the quality gate
+
+- Repository name and visibility (private or public) are chosen when a project is created; an existing `owner/name` can be used instead.
+- A private repo made by one laptop is invisible to the others, so the engine invites each teammate's GitHub login (`collab_add`, run on the owner's laptop), accepts on that teammate's laptop (`collab_accept`) and verifies write access (`repo_access`) before any task starts. Unit-tested with a recording `gh`; **not yet exercised against GitHub with a second real account**.
+- Equal commit counts are no longer required (`min_commits` is 1); the report is "Contributions".
+- After verification passes, a quality review (`repo_audit` hygiene checks plus an AI reviewer against the brief) opens up to two rounds of polish tasks; the result is shown as the Quality review card.
