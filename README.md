@@ -16,6 +16,8 @@ and the lead sees every agent's terminal live on one screen.
 
 | | |
 |---|---|
+| **Hackathon mode** | Paste a problem statement instead of a brief: each teammate's agent researches it and proposes ideas, they critique and rebut each other anonymously, then every agent votes (never for its own idea). The idea with the most votes is built. |
+| **Code judge** | After the quality review, independent judges (one per model source on the team) score the repository blind to who wrote what on a fixed rubric (problem fit, functionality, code quality, testing, documentation, security, innovation and UX). Median per criterion, deterministic caps from measurable facts, disagreement reported. Below 70/100 the engine runs one improvement round; the lead can re-judge any time. |
 | **Projects** | Brief → plan with a frozen interface contract → tasks with disjoint file ownership → one branch and one PR per task → ordered merges → verification → automatic fix rounds → a final quality review (README, tests, repository hygiene, an AI reviewer against your brief) that opens polish tasks until it is clean. Choose the repository name and visibility; K.O.D.E. adds every teammate as a collaborator and accepts the invitation on their laptop automatically. Live task lanes, contributions per person, PR links. |
 | **Your agents, your logins** | Each laptop runs its own Claude Code / Codex / Antigravity / OpenCode / Hermes session. Commits use that person's git identity and are pushed with their own `gh` login. The Brain never holds a GitHub token. |
 | **Join from any laptop** | The lead sends an invite link. The teammate opens it and runs one command (PowerShell on Windows, `curl | sh` on macOS/Linux). |

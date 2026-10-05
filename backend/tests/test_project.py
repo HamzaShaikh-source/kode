@@ -183,6 +183,12 @@ class ScriptedLLM:
         self.calls.append(system[:30])
         if "planning lead" in system:
             return LLMResult(json.dumps(make_plan()), 10, 10, "stop")
+        if "member of a panel judging" in system:
+            card = {"scores": {k: {"score": 8, "evidence": f"{k} looks sound in src/calc.py"} for k in ("fit", "function", "quality", "testing", "docs", "security", "innovation")},
+                    "strengths": ["small, tested, documented"], "improvements": [], "summary": "A tidy small library."}
+            return LLMResult(json.dumps(card), 10, 10, "stop")
+        if "submission text for a hackathon" in system:
+            return LLMResult("# Calc" + chr(10) + chr(10) + "A tiny calculator library. " * 20, 10, 10, "stop")
         fix = {"diagnosis": "mul adds instead of multiplying", "fix_tasks": [{"title": "fix mul", "description": "calc.mul must multiply." + script([step({"src/calc.py": CALC_FIXED}, "fix(calc): mul multiplies")]),
                                                                               "files_owned": ["src/calc.py"], "owner_task": "T1", "weight": 1}]}
         return LLMResult(json.dumps(fix), 10, 10, "stop")
@@ -233,13 +239,15 @@ def test_project_loop_plan_build_guard_merge_verify_fix_done(tmp_path, monkeypat
                 # fix round happened because the first verification failed
                 assert p["round"] == 1 and any(t["id"].startswith("F1") for t in p["tasks"])
                 assert p["verify"]["passed"]
+                assert p["final"]["judge"]["grade"] == "A" and p["judge"]["overall"] == 80.0 and len(p["judge"]["judges"]) >= 1     # the code judge scored the finished repo
+                assert any("reusing" in x["text"] for x in p["log"]), "teammates' agent sessions are reused across their tasks"
                 assert p["final"]["quality"]["issues"] == [] and p["final"]["quality"]["readme"] > 400      # the quality gate found nothing to fix
                 # inspect the shared remote itself
                 remote = p["repo"]
                 clone = tmp_path / "inspect"
                 subprocess.run(["git", "clone", remote, str(clone)], capture_output=True)
                 files = set(git(clone, "ls-files").split())
-                assert {"src/calc.py", "src/fmt.py", "tests/test_calc.py", "tests/test_fmt.py", "README.md", "src/main.py", "docs/CONTRACT.md"} <= files
+                assert {"src/calc.py", "src/fmt.py", "tests/test_calc.py", "tests/test_fmt.py", "README.md", "src/main.py", "docs/CONTRACT.md", "docs/SUBMISSION.md"} <= files
                 assert "src/evil.py" not in files and "tests/__keep__.txt" not in files
                 assert "tampered" not in (clone / "docs" / "CONTRACT.md").read_text()
                 assert "a * b" in (clone / "src" / "calc.py").read_text()

@@ -28,6 +28,7 @@ ap.add_argument("--lan", action="store_true", help="bind 0.0.0.0 (other computer
 ap.add_argument("--public-url", default="", help="the URL teammates use to reach this Brain, e.g. a tunnel: https://name.trycloudflare.com")
 ap.add_argument("--simulation", action="store_true", help="SIMULATION_MODE=1: mock fleet only, no engine/LLM/GitHub")
 ap.add_argument("--demo-nodes", type=int, default=0, help="start N real kode-node agents on this PC with real provider sessions")
+ap.add_argument("--no-lead-node", action="store_true", help="do not join this PC as a teammate (by default the lead's own PC takes tasks and makes commits)")
 ap.add_argument("--no-browser", action="store_true")
 args = ap.parse_args()
 
@@ -68,6 +69,16 @@ def after_start():
             procs.extend(asyncio.run(demo_fleet.setup(f"http://127.0.0.1:{args.port}", key, args.demo_nodes, log=lambda m: print(m, flush=True))))
         except Exception as e:
             print(">>> demo fleet failed:", type(e).__name__, e, flush=True)
+    if not args.no_lead_node and not args.demo_nodes:
+        sys.path.insert(0, str(BACKEND / "scripts"))
+        try:
+            import lead_node
+            key = (BACKEND / ".hub_key").read_text().strip()
+            pr = asyncio.run(lead_node.ensure(f"http://127.0.0.1:{args.port}", key, log=lambda m: print(m, flush=True)))
+            if pr:
+                procs.append(pr)
+        except Exception as e:
+            print(">>> lead PC node failed:", type(e).__name__, e, flush=True)
     if not args.no_browser:
         webbrowser.open(f"http://localhost:{args.port}/console")
 

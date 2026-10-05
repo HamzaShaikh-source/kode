@@ -28,11 +28,13 @@ import time
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Optional
 
+from hub import ideate, judge as jd
 from hub.protocol import ROLE_LEAD, clip, now_ms
 from llm import LLMOutputError, extract_json
 
 MAX_FIX_ROUNDS = 3
 MAX_POLISH_ROUNDS = 2
+MAX_REUSE = 4                                     # one agent session per teammate handles up to this many tasks before a fresh one replaces it (context stays small)
 MAX_TASKS = 40
 TICK_S = 3.0
 IDLE_DONE_S = 40.0            # agent quiet this long after pushing >= min commits => task finished (marker shortens it)
@@ -236,11 +238,32 @@ These are the working conventions for everyone, including you.
 4. Work on your task branch only, never on `{p['base']}`. Push it with `git push -u origin <your-branch>` after your first commit and again at the end.
 5. Work on your own: the team lead is not available for questions during the task. If something is unclear, follow the contract and pick the simplest sensible option.
 6. When everything is committed and pushed, print one line `KODE_DONE <number of commits>` so the lead's dashboard can see that you finished.
+7. If your agent has skills or plugins installed (testing, code review, security review, frontend design, debugging), use the ones that fit your task: TASK.md lists the relevant ones. Prefer them to improvising.
+8. You are one long-lived session that may be given several tasks one after another: finish each task completely, then wait for the next one; never start other sessions or sub-agents unless the task needs them.
 """
 
 
-def render_task(p: dict, t: dict, branch: str, contract_paths: List[str]) -> str:
+ALWAYS_SKILLS = ("test-driven-development", "tdd-workflow", "systematic-debugging", "code-review", "requesting-code-review", "security-review", "simplify")
+_WORD = re.compile(r"[a-z][a-z0-9]{3,}")
+
+
+def pick_skills(skills: List[dict], text: str, limit: int = 8) -> List[dict]:
+    """The installed skills most relevant to this task: keyword overlap with the task text, plus the general quality skills when they exist."""
+    words = set(_WORD.findall(text.lower()))
+    scored = []
+    for s in skills or []:
+        hay = set(_WORD.findall((s["name"].replace("-", " ") + " " + s.get("description", "")).lower()))
+        score = len(words & hay) + (3 if s["name"] in ALWAYS_SKILLS else 0) + (2 if any(w in words for w in _WORD.findall(s["name"].replace("-", " "))) else 0)
+        if score >= 3:
+            scored.append((score, s))
+    scored.sort(key=lambda x: (-x[0], x[1]["name"]))
+    return [s for _, s in scored[:limit]]
+
+
+def render_task(p: dict, t: dict, branch: str, contract_paths: List[str], skills: Optional[List[dict]] = None) -> str:
     deps = ", ".join(t["depends_on"]) or "none"
+    use = pick_skills(skills or [], " ".join([t["title"], t["description"], " ".join(t["files_owned"])]))
+    skill_block = ("## Skills installed on this laptop (use the ones that fit; invoke them instead of improvising)" + chr(10) + chr(10).join(f"- {s['name']}: {s['description']}" for s in use) + chr(10) * 2) if use else ""
     return f"""# Task {t['id']}: {t['title']}
 
 Project: {p['name']}
@@ -258,7 +281,7 @@ Brief: {p['brief']}
 ## Frozen contract (read, never edit)
 {chr(10).join('- ' + c for c in contract_paths)}
 
-## Git
+{skill_block}## Git
 - Branch: `{branch}` (already checked out). Base branch: `{p['base']}`. Dependencies already merged: {deps}.
 - Commit at sensible steps: one good commit for a small task, more when the work has natural stages. Push with `git push -u origin {branch}`.
 - Quality bar: this repository will be reviewed by engineers and AI reviewers. Clean code, real error handling, no placeholders or TODOs, tests that mean something.
@@ -457,6 +480,19 @@ class ProjectEngine:
             return RetryingLLM(inner, max_tries=2, base_delay_s=2.0, deadline_s=900)
         return o._client()
 
+    def member_client(self, p: dict, m: dict):
+        """A teammate's own model for one-shot questions (ideas, votes, judging): their API profile, or their Claude Code / Codex login, else the planner."""
+        if self.llm_override is not None:
+            return self.llm_override
+        if m.get("profile_id"):
+            from hub.orchestrator import ProfileClient
+            prof = self.hub.store.get_profile(m["profile_id"], with_key=True)
+            if prof:
+                return ProfileClient(prof, m.get("model") or prof.get("default_model", ""), timeout=600)
+        if m["provider"] in ("claude", "codex"):
+            return CliClient(self, m["provider"], m["node_id"])
+        return self.client(p)
+
     # ───────────── viewer commands ─────────────
     async def on_viewer(self, v, t: str, m: dict) -> None:
         ref = m.get("ref")
@@ -503,6 +539,9 @@ class ProjectEngine:
                 self.hub.store.delete_project(pid)
                 self.hub.push_projects()
                 await res(ok=True)
+            elif t == "project_judge" and p and p["status"] in ("done", "failed", "paused") and p.get("repo") and p.get("coordinator"):
+                self._spawn(p, self.rejudge(p))
+                await res(ok=True)
             elif t == "project_card" and p:
                 c = next((x for x in p.get("cards", []) if x["id"] == m.get("card")), None)
                 if c:
@@ -530,7 +569,7 @@ class ProjectEngine:
             raise ValueError("a name and a brief (what to build) are required")
         members = []
         want = m.get("members") or []
-        online = [n for n in self.hub.nodes.values() if n.online]
+        online = sorted((n for n in self.hub.nodes.values() if n.online), key=lambda n: n.hostname.lower() != self.hub.hostname.lower())      # the lead's own PC first
         sel = {str(x.get("node_id")): x for x in want if isinstance(x, dict)}
         for n in online:
             if sel and n.id not in sel:
@@ -552,7 +591,8 @@ class ProjectEngine:
              "auto_approve_plan": bool(m.get("auto_approve_plan")), "permissions": m.get("permissions") if m.get("permissions") in ("ask", "auto", "turbo") else "turbo",
              "user_test_cmds": [str(c) for c in (m.get("test_cmds") or []) if str(c).strip()][:5],
              "planner": self.parse_planner(m.get("planner"), members), "slug": f"{slug(name, 18)}-{pid[2:]}", "feedback": "",
-             "repo_name": rname or slug(name, 40), "visibility": "public" if m.get("visibility") == "public" else "private", "polish_round": 0}
+             "repo_name": rname or slug(name, 40), "visibility": "public" if m.get("visibility") == "public" else "private", "polish_round": 0,
+             "hackathon": bool(m.get("hackathon")), "judge_round": 0}
         self.items[pid] = p
         self.save(p)
         self.start_planning(p)
@@ -600,7 +640,14 @@ class ProjectEngine:
     def start_planning(self, p: dict) -> None:
         p["status"], p["phase"], p["error"], p["note"] = "planning", "plan", "", "Drafting the plan..."
         self.save(p)
-        self._spawn(p, self.plan(p))
+        self._spawn(p, self.plan_flow(p))
+
+    async def plan_flow(self, p: dict) -> None:
+        if p.get("hackathon") and not (p.get("ideation") or {}).get("winner"):
+            await ideate.run(self, p)
+            p["phase"], p["note"] = "plan", "Drafting the plan..."
+            self.save(p)
+        await self.plan(p)
 
     def start(self, p: dict) -> None:
         p["status"], p["error"], p["note"] = "running", "", ""
@@ -821,10 +868,20 @@ class ProjectEngine:
                 clean = await self.net_retry(p, "quality review", lambda: self.quality_review(p))
                 if p["status"] != "running":
                     return
-                if clean:
-                    await self.net_retry(p, "final report", lambda: self.finish(p))
+                if not clean:
+                    p["phase"] = "build"
+                    continue
+                p["phase"] = "judge"
+            if p["phase"] == "judge":
+                done = await self.net_retry(p, "code judge", lambda: self.judge_review(p))
+                if p["status"] != "running":
                     return
-                p["phase"] = "build"
+                if not done:
+                    p["phase"] = "build"
+                    continue
+                await self.net_retry(p, "submission write-up", lambda: self.submission_pack(p))
+                await self.net_retry(p, "final report", lambda: self.finish(p))
+                return
 
     async def check_agent(self, p: dict, m: dict) -> None:
         """Fail early, with the fix spelled out, if a teammate's chosen agent is missing or not signed in (instead of a task that silently never starts)."""
@@ -896,6 +953,7 @@ class ProjectEngine:
             r = await self.must(p, m["node_id"], "preflight", 60)
             pre[m["node_id"]] = r
             m["git_email"], m["git_name"], m["gh_user"] = r.get("git_email", ""), r.get("git_name", ""), r.get("gh_user", "")
+            m["skills"] = [x for x in (r.get("skills") or []) if isinstance(x, dict) and x.get("name")][:120]
             if not r.get("git"):
                 raise RuntimeError(f"git is not installed on {m['name']}'s laptop")
             if p["forge"] == "github" and not r.get("gh"):
@@ -903,7 +961,9 @@ class ProjectEngine:
             if not r.get("git_email"):
                 self.log(p, "warn", f"{m['name']}: no git user.email configured; commits may not be attributed")
             await self.check_agent(p, m)
-        coord = next((m for m in p["members"] if pre[m["node_id"]].get("gh") or p["forge"] == "local"), p["members"][0])
+        ok = [m for m in p["members"] if pre[m["node_id"]].get("gh") or p["forge"] == "local"]
+        host_first = sorted(ok, key=lambda m: not getattr(self.hub.nodes.get(m["node_id"]), "hostname", "").lower() == getattr(self.hub, "hostname", "").lower())
+        coord = (host_first or p["members"])[0]                            # the lead's own PC coordinates when it is on the team: contract, merges and the final commits are the lead's
         p["coordinator"] = coord["node_id"]
         cn = coord["node_id"]
         if not p["repo"]:
@@ -986,27 +1046,46 @@ class ProjectEngine:
         t["branch"] = branch
         self.log(p, "task", f"{t['id']} '{t['title']}' -> {m['name']} ({m['provider']}) on branch {branch}", t["id"])
         await self.must(p, nid, "git_prepare", 180, dir=d, repo=p["repo"], base=p["base"], branch=branch, forge=p["forge"], resume=bool(t.get("attempts") or t.get("restarts")))
-        await self.must(p, nid, "write_task", 30, dir=d, fname="TASK.md", content=render_task(p, t, branch, p.get("contract_paths", [])))
+        await self.must(p, nid, "write_task", 30, dir=d, fname="TASK.md", content=render_task(p, t, branch, p.get("contract_paths", []), m.get("skills")))
         from hub.apiprofiles import project_args
-        old = self.hub.sessions.get(t.get("sid", ""))
-        if old and old.state in ("live", "starting"):
-            await self.hub.stop_session(old.sid, "orchestrator")                       # never two agents in one working folder
-            await asyncio.sleep(1.0)
-        sid = await self.hub.start_session(nid, m["provider"], d, "orchestrator", profile_id=m.get("profile_id", ""), model=m.get("model", ""),
-                                           extra_args=project_args(m["provider"], p["permissions"] in ("auto", "turbo"), p["permissions"] == "turbo", resume=bool(t.get("restarts"))))
-        if not sid:
-            raise RuntimeError(f"could not start {m['provider']} on {m['name']}'s laptop")
-        t["sid"] = sid
-        s = self.hub.sessions[sid]
-        for _ in range(120):                                              # wait for the session to come up and the TUI banner to settle
-            await asyncio.sleep(0.5)
-            if s.state in ("error", "exited", "offline"):
-                raise RuntimeError(f"{m['provider']} failed to start: {s.error or s.state}")
-            if s.state == "live" and time.time() - s.last_out > 2.5 and s.bytes_out > 0:
-                break
-        await self.settle_prompts(p, t, s)
-        await self.type_line(s, f"You are a teammate on project {p['name']}. Read .kode/TASK.md and CLAUDE.md, do exactly what the task says, commit often, push your branch, then print KODE_DONE and the number of commits.")
-        asyncio.create_task(self.ensure_submitted(s, "Read .kode/TASK.md"))
+        ms = p.setdefault("msess", {}).get(nid) or {}
+        cur = self.hub.sessions.get(ms.get("sid", ""))
+        again = bool(t.get("attempts") or t.get("restarts"))             # a retried or restarted task gets a fresh agent; a stuck one is not reused
+        reuse = cur if (cur and cur.state == "live" and not again and ms.get("tasks", 0) < MAX_REUSE and ms.get("dir") == d and ms.get("provider") == m["provider"]) else None
+        if reuse is None:
+            stopped = False
+            for sid0 in {t.get("sid", ""), ms.get("sid", "")} - {""}:
+                o = self.hub.sessions.get(sid0)
+                if o and o.state in ("live", "starting"):
+                    await self.hub.stop_session(o.sid, "orchestrator")                 # never two agents in one working folder
+                    stopped = True
+            if stopped:
+                await asyncio.sleep(1.0)
+            sid = await self.hub.start_session(nid, m["provider"], d, "orchestrator", profile_id=m.get("profile_id", ""), model=m.get("model", ""),
+                                               extra_args=project_args(m["provider"], p["permissions"] in ("auto", "turbo"), p["permissions"] == "turbo", resume=bool(t.get("restarts"))))
+            if not sid:
+                raise RuntimeError(f"could not start {m['provider']} on {m['name']}'s laptop")
+            t["sid"] = sid
+            s = self.hub.sessions[sid]
+            for _ in range(120):                                              # wait for the session to come up and the TUI banner to settle
+                await asyncio.sleep(0.5)
+                if s.state in ("error", "exited", "offline"):
+                    raise RuntimeError(f"{m['provider']} failed to start: {s.error or s.state}")
+                if s.state == "live" and time.time() - s.last_out > 2.5 and s.bytes_out > 0:
+                    break
+            await self.settle_prompts(p, t, s)
+            p["msess"][nid] = {"sid": sid, "tasks": 0, "dir": d, "provider": m["provider"]}
+            first = f"You are a teammate on project {p['name']}. Read .kode/TASK.md and CLAUDE.md, do exactly what the task says, use your relevant skills, commit sensibly, push your branch, then print KODE_DONE and the number of commits."
+        else:
+            s, sid = reuse, reuse.sid
+            t["sid"] = sid
+            first = f"Next task for you: {t['id']} ({t['title']}). .kode/TASK.md was just replaced and the branch switched. Read it again, do exactly what it says (use your relevant skills), commit sensibly, push your branch, then print KODE_DONE and the number of commits."
+            self.log(p, "task", f"{t['id']}: reusing {m['name']}'s running agent session (task {ms.get('tasks', 0) + 1} of at most {MAX_REUSE} for it)", t["id"])
+        p["msess"][nid]["tasks"] += 1
+        t["mark0"] = t["prompt_mark"] = s.bytes_out                         # only text printed after this point counts as this task's progress
+        t["dlg_sig"] = ""
+        await self.type_line(s, first)
+        asyncio.create_task(self.ensure_submitted(s, "Read .kode/TASK.md" if reuse is None else "Read it again"))
         t["status"], t["started"], t["last_progress"] = "running", time.time(), time.time()
         t["last_head"], t["settled"] = "", 0
         self.save(p)
@@ -1127,7 +1206,7 @@ class ProjectEngine:
             else:
                 t["dlg_sig"], t["dlg_since"] = sig, time.time()
             quiet0 = time.time() - t.get("last_progress", time.time())
-            if not hit and time.time() - s.last_out > 30 and quiet0 > 60 and not DONE_MARK.search(self.screen(s, 1500)):
+            if not hit and time.time() - s.last_out > 30 and quiet0 > 60 and not DONE_MARK.search(self.fresh(s, t.get("mark0", 0), 1500)):
                 await self.supervise(p, t, s, self.screen(s, 1800), "the agent has printed nothing for 30s and made no commit for a minute")
         gs = await self.op(nid, "git_status", 60, dir=d, base=p["base"], branch=t["branch"])
         if not gs.get("ok"):
@@ -1137,7 +1216,7 @@ class ProjectEngine:
         if gs["head"] != t.get("last_head"):
             t["last_head"], t["last_progress"] = gs["head"], time.time()
         idle = time.time() - s.last_out if s and not dead else 999
-        marker = bool(s and DONE_MARK.search(self.screen(s, 2500)))
+        marker = bool(s and DONE_MARK.search(self.fresh(s, t.get("mark0", 0), 2500)))
         enough = gs["ahead"] >= t["min_commits"] or (marker and gs["ahead"] >= 1)
         finished = enough and (idle >= IDLE_DONE_S or (marker and idle >= MARKER_IDLE_S)) and (gs["pushed"] or idle >= IDLE_DONE_S * 2)
         if dead and not marker:
@@ -1242,8 +1321,11 @@ class ProjectEngine:
             return
         t["status"], t["done_at"] = "merged", time.time()
         if t.get("sid"):
-            await self.hub.stop_session(t["sid"], "orchestrator")
-            self.retire(t["sid"])
+            ms = p.get("msess", {}).get(nid, {})
+            more = any(x["owner"] == nid and x is not t and x["status"] not in ("merged", "cancelled") for x in p["tasks"])
+            if not (more and ms.get("sid") == t["sid"] and ms.get("tasks", 0) < MAX_REUSE and p["status"] == "running"):
+                await self.hub.stop_session(t["sid"], "orchestrator")          # nothing more for this teammate: end the session
+                self.retire(t["sid"])
         self.log(p, "merge", f"{t['id']} merged into {p['base']} ({gs['ahead']} commits by {m['name']})", t["id"])
 
     # ───────────── verify / fix / finish ─────────────
@@ -1369,17 +1451,109 @@ class ProjectEngine:
             return True
         p["polish_round"] = p.get("polish_round", 0) + 1
         self.log(p, "quality", f"quality review round {p['polish_round']}: {len(keep)} improvement task(s): " + "; ".join(k["title"] for k in keep[:4]))
-        load = {m["node_id"]: sum(t["weight"] for t in p["tasks"] if t["owner"] == m["node_id"]) for m in p["members"]}
-        for i, it in enumerate(keep[:5]):
-            owner = min(load, key=load.get)
-            load[owner] += 1
-            p["tasks"].append({"id": f"Q{p['polish_round']}-{i + 1}", "title": it["title"], "description": it["description"], "acceptance": "A reviewer would no longer flag this.",
-                               "files_owned": it["files"], "depends_on": [], "weight": 1, "owner": owner, "min_commits": 1, "status": "pending", "sid": "", "branch": "", "pr_url": "",
-                               "commits": 0, "round": 100 + p["polish_round"], "attempts": 0, "violations": 0, "nudges": 0, "log": []})
-        self.save(p)
+        self.add_fix_tasks(p, keep[:5], f"Q{p['polish_round']}", 100 + p["polish_round"])
         return False
 
+    def add_fix_tasks(self, p: dict, items: List[dict], prefix: str, rnd: int) -> None:
+        """Improvement tasks go to whoever has the least work so far (the lead's PC included), each on its own disjoint files."""
+        load = {m["node_id"]: sum(t["weight"] for t in p["tasks"] if t["owner"] == m["node_id"]) for m in p["members"]}
+        for i, it in enumerate(items):
+            owner = min(load, key=load.get)
+            load[owner] += 1
+            p["tasks"].append({"id": f"{prefix}-{i + 1}", "title": it["title"], "description": it["description"], "acceptance": "A reviewer would no longer flag this.",
+                               "files_owned": it["files"], "depends_on": [], "weight": 1, "owner": owner, "min_commits": 1, "status": "pending", "sid": "", "branch": "", "pr_url": "",
+                               "commits": 0, "round": rnd, "attempts": 0, "violations": 0, "nudges": 0, "log": []})
+        self.save(p)
+
+    # ───────────── the code judge ─────────────
+    def judge_clients(self, p: dict) -> List[tuple]:
+        """Independent judges: one per distinct model source on the team (own CLI login or API profile), the planner as a fallback; at most three."""
+        out, seen = [], set()
+        for m in p["members"]:
+            key = ("profile", m["profile_id"]) if m.get("profile_id") else ("cli", m["provider"]) if m["provider"] in ("claude", "codex") else None
+            if key and key not in seen:
+                seen.add(key)
+                out.append((f"{m['provider']}" + (f" / {m['profile_id']}" if m.get("profile_id") else " (own login)"), self.member_client(p, m)))
+        if not out:
+            out.append((self.planner_label(p), self.client(p)))
+        return out[:3]
+
+    async def judge_review(self, p: dict, rejudge: bool = False) -> bool:
+        """Score the finished repository. True = done (scored, or judging unavailable); False = improvement tasks were added and the build must run again."""
+        await self.ensure_coordinator(p)
+        cn, d = p["coordinator"], self.cdir(p)
+        await self.must(p, cn, "git_prepare", 180, dir=d, repo=p["repo"], base=p["base"], forge=p["forge"])
+        a = await self.must(p, cn, "repo_audit", 120, dir=d)
+        caps = jd.caps_from_audit(a, bool((p.get("verify") or {}).get("passed")))
+        clients = self.judge_clients(p)
+        self.log(p, "judge", f"judging with {len(clients)} independent judge(s): " + ", ".join(c[0] for c in clients))
+        try:
+            card = await jd.run_judges(clients, jd.evidence(p, a), caps)
+        except Exception as e:
+            self.log(p, "warn", f"the code judge could not score the project: {clip(str(e), 220)}")
+            p["judge"] = {"error": clip(str(e), 300), "ts": time.time()}
+            self.save(p)
+            return True
+        card["ts"], card["round"], card["loc"] = time.time(), p.get("judge_round", 0), a.get("loc", 0)
+        hist = (p.get("judge") or {}).get("history", []) if isinstance(p.get("judge"), dict) else []
+        card["history"] = (hist + [card["overall"]])[-6:]
+        p["judge"] = card
+        self.log(p, "judge", f"score {card['overall']}/100 (grade {card['grade']})" + (f"; judges disagree on {len(card['disagreement'])} criterion/criteria" if card["disagreement"] else ""))
+        self.save(p)
+        if rejudge or card["overall"] >= jd.JUDGE_PASS or p.get("judge_round", 0) >= 1:
+            return True
+        items = []
+        for it in card["improvements"]:
+            if it["severity"] == "minor":
+                continue
+            files = [f for f in it["files"] if _safe_rel(f.replace("*", "x")) and not any(globs_overlap(f, c) for c in p["contract_paths"])]
+            if files and not any(globs_overlap(x, y) for k in items for x in k["files"] for y in files):
+                items.append({"title": it["title"], "description": it["detail"], "files": files[:10]})
+        if not items:
+            return True
+        p["judge_round"] = p.get("judge_round", 0) + 1
+        self.log(p, "judge", f"below {jd.JUDGE_PASS}: one improvement round with {len(items[:4])} task(s) from the judges' findings")
+        self.add_fix_tasks(p, items[:4], f"J{p['judge_round']}", 200 + p["judge_round"])
+        return False
+
+    async def rejudge(self, p: dict) -> None:
+        try:
+            await self.judge_review(p, rejudge=True)
+        except Exception as e:
+            self.log(p, "warn", f"re-judging failed: {clip(str(e), 200)}")
+
+    SUBMISSION_SYSTEM = """You write the submission text for a hackathon entry (Devpost style) from the facts given. Be concrete and honest: describe only what the repository really does.
+Markdown with these sections: a one-line tagline; Inspiration / the problem; What it does; How we built it (stack and architecture); Challenges; What is next; A 3-minute demo script (numbered steps).
+No hype words, no invented features or statistics. Reply with the markdown only."""
+
+    async def submission_pack(self, p: dict) -> None:
+        """docs/SUBMISSION.md: the write-up a hackathon form asks for, from the brief, the plan, the README and the judge's scorecard. Failure is not fatal."""
+        try:
+            await self.ensure_coordinator(p)
+            cn, d = p["coordinator"], self.cdir(p)
+            a = await self.must(p, cn, "repo_audit", 120, dir=d)
+            j = p.get("judge") or {}
+            facts = (f"PROJECT: {p['name']}\nPROBLEM / BRIEF:\n{p.get('problem') or p['brief']}\n\nPLAN SUMMARY: {(p.get('plan') or {}).get('summary', '')}\nSTACK: {(p.get('plan') or {}).get('stack', '')}\n"
+                     f"CHOSEN IDEA: {(p.get('ideation') or {}).get('winner_title', '-')}\n\nREADME:\n{a.get('readme', '')[:3500]}\n\nFILES:\n" + "\n".join((a.get("files") or [])[:80])
+                     + (f"\n\nSELF-ASSESSMENT (automatic judge): {j.get('overall')}/100; strengths: {'; '.join(j.get('strengths', []))}" if j.get("overall") else ""))
+            res = await asyncio.wait_for(self.client(p).complete(self.SUBMISSION_SYSTEM, facts, max_tokens=2500), 420)
+            text = res.text.strip()
+            if len(text) < 300:
+                return
+            await self.must(p, cn, "write_files", 120, dir=d, base=p["base"], files={"docs/SUBMISSION.md": text + "\n"}, message="docs: add hackathon submission write-up (K.O.D.E.)")
+            self.log(p, "git", "wrote docs/SUBMISSION.md (tagline, story, architecture and a demo script)")
+        except Exception as e:
+            self.log(p, "warn", f"submission write-up skipped: {clip(str(e), 160)}")
+
+    async def close_sessions(self, p: dict) -> None:
+        for ms in list((p.get("msess") or {}).values()):
+            o = self.hub.sessions.get(ms.get("sid", ""))
+            if o and o.state in ("live", "starting"):
+                await self.hub.stop_session(o.sid, "orchestrator")
+                self.retire(o.sid)
+
     async def finish(self, p: dict, failed: bool = False) -> None:
+        await self.close_sessions(p)
         cn = p["coordinator"]
         stats = await self.op(cn, "log_stats", 60, dir=self.cdir(p), base=p["base"], since=p.get("base_sha", ""))
         by_email = {a["email"].lower(): a for a in stats.get("authors", [])}
@@ -1389,7 +1563,8 @@ class ProjectEngine:
             tasks = [t for t in p["tasks"] if t["owner"] == m["node_id"]]
             bal.append({"member": m["name"], "email": m.get("git_email", ""), "commits": a.get("commits", 0), "added": a.get("added", 0), "removed": a.get("removed", 0),
                         "tasks": len(tasks), "merged": sum(1 for t in tasks if t["status"] == "merged"), "violations": sum(t.get("violations", 0) for t in tasks)})
-        p["final"] = {"balance": bal, "passed": not failed, "rounds": p["round"], "finished": time.time(), "quality": p.get("quality")}
+        p["final"] = {"balance": bal, "passed": not failed, "rounds": p["round"], "finished": time.time(), "quality": p.get("quality"),
+                      "judge": ({k: v for k, v in (p.get("judge") or {}).items() if k in ("overall", "grade")} or None)}
         if not failed:
             p["status"], p["phase"], p["note"] = "done", "done", "Project complete: all tasks merged and the verification commands pass."
             self.log(p, "done", "project complete; verification passed")

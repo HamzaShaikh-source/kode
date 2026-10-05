@@ -154,3 +154,11 @@ Windows Defender finding: the one-liner `powershell -ExecutionPolicy Bypass -Com
 - A private repo made by one laptop is invisible to the others, so the engine invites each teammate's GitHub login (`collab_add`, run on the owner's laptop), accepts on that teammate's laptop (`collab_accept`) and verifies write access (`repo_access`) before any task starts. Unit-tested with a recording `gh`; **not yet exercised against GitHub with a second real account**.
 - Equal commit counts are no longer required (`min_commits` is 1); the report is "Contributions".
 - After verification passes, a quality review (`repo_audit` hygiene checks plus an AI reviewer against the brief) opens up to two rounds of polish tasks; the result is shown as the Quality review card.
+
+## Hackathon mode, code judge, session reuse, lead PC
+
+- `hub/ideate.py`: four rounds run by the teammates' own agents (propose with research, anonymous critique, rebuttal, vote; never for your own idea). Unit-tested with scripted agents. **Research quality depends on whether the agent's CLI can search the web in non-interactive mode**; the prompt asks for it and records when it could not.
+- `hub/judge.py`: blind, independent judges, fixed rubric, deterministic caps, median aggregation, disagreement reported. Unit-tested; wired into the hermetic project loop. A model still has preferences: the scorecard lists every judge's score.
+- One agent session per teammate is reused across that teammate's tasks (at most 4, then a fresh one; a retried or restarted task always gets a fresh agent). Done markers only count output printed since the task started.
+- `run_kode.py` joins the lead's own PC as a teammate by default (`--no-lead-node` to disable); the lead PC coordinates merges, so contract, plan and final commits are the lead's, and it receives tasks like everyone else.
+- Relevant installed skills (from `~/.claude/skills`, `~/.agents/skills`, `~/.codex/skills`) are listed in each task for the agent to use.

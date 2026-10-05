@@ -6,7 +6,8 @@ import * as hub from '../hubclient.js';
 
 const STATUS = { draft: ['Draft', ''], planning: ['Planning', 'info'], plan_ready: ['Plan ready', 'warn'], running: ['Running', 'accent'], paused: ['Paused', 'warn'], done: ['Done', 'ok'], failed: ['Failed', 'bad'], cancelled: ['Cancelled', ''] };
 const TASK = { pending: ['Waiting', ''], starting: ['Starting', 'info'], running: ['Building', 'accent'], review: ['Merging', 'info'], merged: ['Merged', 'ok'], blocked: ['Blocked', 'bad'], cancelled: ['Cancelled', ''] };
-const PHASES = [['plan', 'Plan'], ['bootstrap', 'Contract'], ['build', 'Build'], ['verify', 'Verify'], ['polish', 'Polish'], ['done', 'Done']];
+const PHASES = [['plan', 'Plan'], ['bootstrap', 'Contract'], ['build', 'Build'], ['verify', 'Verify'], ['polish', 'Polish'], ['judge', 'Judge'], ['done', 'Done']];
+const HACK_PHASES = [['ideate', 'Ideas'], ...PHASES];
 
 export function openNewProject() {
   const nodes = S.nodes.filter((n) => n.online);
@@ -23,6 +24,9 @@ export function openNewProject() {
   const picker = plannerPicker(nodes);
   forge.addEventListener('change', syncRepo); repo.addEventListener('input', syncRepo); syncRepo();
   const auto = h('input', { type: 'checkbox', id: 'np-auto' });
+  const hack = h('input', { type: 'checkbox', id: 'np-hack' });
+  const briefLabel = h('span', {}, 'Brief');
+  hack.addEventListener('change', () => { setText(briefLabel, hack.checked ? 'Problem statement' : 'Brief'); brief.placeholder = hack.checked ? 'Paste the hackathon problem statement and any constraints (time, judging criteria, required tech). Your agents will research it, propose ideas, debate and vote.' : 'What should the team build? Include the must-have features, the stack if you care, and the demo you want to show.'; });
   const perms = h('select', { id: 'np-perm' }, h('option', { value: 'turbo' }, 'Turbo: agents never ask for permission (fastest)'), h('option', { value: 'auto' }, 'Supervised: agents ask, the supervisor model answers'), h('option', { value: 'ask' }, 'Ask me: every agent question becomes a card'));
   const err = h('div', { class: 'field-err', role: 'alert' });
   const rows = nodes.map((n, idx) => {
@@ -32,12 +36,14 @@ export function openNewProject() {
     const order = ['claude', 'agy', 'codex'];                       // a mixed team by default; OpenCode and Hermes stay selectable
     const pref = [order[idx % order.length], ...order, 'opencode', 'hermes'].find((x) => provs.some((p) => p.id === x)); if (pref) sel.value = pref;
     const prof = h('select', { 'aria-label': 'Model source for ' + (n.member_name || n.name) }, h('option', { value: '' }, 'Own login'), S.profiles.map((p) => h('option', { value: p.id }, p.name)));
-    return { n, on, sel, prof, el: h('div', { class: 'mrow' }, on, h('div', { class: 'mrow-n' }, h('b', {}, n.member_name || n.name), h('small', { class: 'faint' }, n.access === 'full' ? 'full access' : n.access === 'copilot' ? 'co-pilot access' : 'asks each time')), sel, prof) };
+    return { n, on, sel, prof, el: h('div', { class: 'mrow' }, on, h('div', { class: 'mrow-n' }, h('b', {}, n.member_name || n.name), h('small', { class: 'faint' }, (n.same_host ? 'Lead PC, ' : '') + (n.access === 'full' ? 'full access' : n.access === 'copilot' ? 'co-pilot access' : 'asks each time'))), sel, prof) };
   });
   const go = h('button', { class: 'btn primary', type: 'button' }, icon('play', 14), 'Plan the project');
   const body = h('div', { style: { display: 'grid', gap: '14px' } },
-    h('label', { class: 'f', for: 'np-name' }, 'Project name', name), h('label', { class: 'f', for: 'np-brief' }, 'Brief', brief),
-    h('div', { class: 'f' }, 'Team and agents', h('small', {}, 'Each teammate builds with the agent you pick on their own laptop.'), h('div', { class: 'mlist' }, rows.map((r) => r.el))),
+    h('label', { class: 'f', for: 'np-name' }, 'Project name', name),
+    h('label', { class: 'opt' }, hack, h('span', {}, h('b', {}, 'Hackathon mode: let the agents decide what to build'), h('small', {}, 'Paste the problem statement. Each agent researches it and proposes ideas; they critique each other, rebut, then vote. The idea with the most votes is built.'))),
+    h('label', { class: 'f', for: 'np-brief' }, briefLabel, brief),
+    h('div', { class: 'f' }, 'Team and agents', h('small', {}, 'Each teammate builds with the agent you pick on their own laptop. The lead’s own PC takes tasks and makes commits like everyone else.'), nodes.some((n) => n.same_host) ? null : h('div', { class: 'note warn' }, 'This PC (the Brain) is not on the team, so you would have no tasks or commits. Restart with run_kode.py (it joins this PC automatically) or add it from the Team page.'), h('div', { class: 'mlist' }, rows.map((r) => r.el))),
     h('div', { class: 'grid2' }, h('label', { class: 'f', for: 'np-forge' }, 'Where the code lives', forge), h('label', { class: 'f', for: 'np-repo' }, 'Use an existing repository (optional)', repo)),
     newRepo,
     picker.el,
@@ -50,7 +56,7 @@ export function openNewProject() {
     try {
       if (picker.empty) throw new Error('No planner is available: log in to Claude Code or Codex on a laptop, or add an API profile on the Models page.');
       const members = rows.filter((r) => r.on.checked && r.sel.value).map((r) => ({ node_id: r.n.id, provider: r.sel.value, profile_id: r.prof.value }));
-      const r = await hub.call({ t: 'project_create', name: name.value, brief: brief.value, repo: repo.value, repo_name: rname.value.trim(), visibility: vis.value, forge: forge.value, members, test_cmds: tests.value.trim() ? [tests.value.trim()] : [], auto_approve_plan: auto.checked, planner: picker.spec(), permissions: perms.value });
+      const r = await hub.call({ t: 'project_create', name: name.value, brief: brief.value, repo: repo.value, repo_name: rname.value.trim(), visibility: vis.value, forge: forge.value, members, test_cmds: tests.value.trim() ? [tests.value.trim()] : [], auto_approve_plan: auto.checked, planner: picker.spec(), permissions: perms.value, hackathon: hack.checked });
       if (!r.ok) throw new Error(r.err || 'could not create');
       close(); location.hash = '#/projects/' + r.id;
     } catch (e) { setText(err, e.message); go.disabled = false; }
@@ -102,12 +108,14 @@ export function mount(root, arg) {
     if (p.status === 'paused' || (p.status === 'failed' && p.phase !== 'plan' && p.plan && p.plan.contract_files.length)) acts.append(h('button', { class: 'btn sm primary', type: 'button', onclick: () => act('project_resume', p.id) }, 'Resume'));
     if (['running', 'paused', 'planning', 'plan_ready'].includes(p.status)) acts.append(h('button', { class: 'btn sm danger', type: 'button', onclick: () => { if (confirm('Cancel this project? Running agent sessions are stopped.')) act('project_cancel', p.id); } }, 'Cancel'));
     else acts.append(h('button', { class: 'btn sm danger', type: 'button', onclick: async () => { if (confirm('Delete this project record? The repository is not touched.')) { await act('project_delete', p.id); location.hash = '#/projects'; } } }, icon('trash', 13), 'Delete'));
-    const phaseIdx = Math.max(0, PHASES.findIndex((x) => x[0] === (p.status === 'done' ? 'done' : p.phase)));
+    if (['done', 'failed', 'paused'].includes(p.status) && p.repo && p.coordinator) acts.append(h('button', { class: 'btn sm', type: 'button', title: 'Score the repository again with the independent judges', onclick: () => act('project_judge', p.id) }, 'Judge again'));
+    const PH = p.hackathon ? HACK_PHASES : PHASES;
+    const phaseIdx = Math.max(0, PH.findIndex((x) => x[0] === (p.status === 'done' ? 'done' : p.phase)));
     wrap.append(h('div', { class: 'phead' },
       h('div', {}, h('div', { class: 'prow-t' }, h('h2', { class: 'ptitle' }, p.name), chip(st, cls)), h('p', { class: 'muted', style: { maxWidth: '70ch' } }, p.brief),
         p.repo ? h('div', { class: 'faint mono', style: { fontSize: '12.5px' } }, p.forge === 'github' ? 'github.com/' + p.repo : p.repo) : null),
       acts));
-    wrap.append(h('ol', { class: 'psteps', 'aria-label': 'Progress' }, PHASES.map(([k, l], i) => h('li', { class: i < phaseIdx || p.status === 'done' ? 'done' : i === phaseIdx ? 'now' : '' }, l))));
+    wrap.append(h('ol', { class: 'psteps', 'aria-label': 'Progress' }, PH.map(([k, l], i) => h('li', { class: i < phaseIdx || p.status === 'done' ? 'done' : i === phaseIdx ? 'now' : '' }, l))));
     if (p.note && p.status !== 'done') wrap.append(h('div', { class: 'note' }, p.note));
     if (p.error) {
       const rp = p.status === 'failed' && p.phase === 'plan' ? plannerPicker(S.nodes.filter((n) => n.online)) : null;
@@ -120,10 +128,12 @@ export function mount(root, arg) {
             : [h('button', { class: 'btn sm', type: 'button', onclick: () => act('project_card', p.id, { card: c.id, action: 'dismiss' }) }, 'Dismiss'), h('button', { class: 'btn sm', type: 'button', onclick: () => act('project_card', p.id, { card: c.id, action: 'skip' }) }, 'Skip task'), h('button', { class: 'btn sm primary', type: 'button', onclick: () => act('project_card', p.id, { card: c.id, action: 'retry' }) }, 'Retry')])));
       wrap.append(b);
     }
+    if (p.ideation && p.ideation.ideas && p.ideation.ideas.length) wrap.append(ideasCard(p));
     if (p.plan && p.status === 'plan_ready') wrap.append(planReview(p));
     if (p.tasks && p.tasks.length && p.status !== 'plan_ready') wrap.append(lanes(p));
     if (p.tasks && p.tasks.length) wrap.append(balance(p));
     if (p.verify) wrap.append(verifyCard(p));
+    if (p.judge && p.judge.criteria) wrap.append(judgeCard(p));
     const q = (p.final && p.final.quality) || p.quality;
     if (q) wrap.append(qualityCard(p, q));
     if (p.final && p.final.passed) wrap.append(h('div', { class: 'note ok' }, h('b', {}, 'Finished. '), `All ${p.tasks.length} tasks merged and the verification commands pass${p.round ? ` after ${p.round} fix round(s)` : ''}.`));
@@ -169,6 +179,37 @@ export function mount(root, arg) {
     const max = Math.max(1, ...rows.map((r) => r.commits));
     return h('div', {}, h('div', { class: 'sec-h' }, h('h2', {}, 'Contributions'), h('p', {}, p.final ? 'Final, from git history' : 'Live, from each laptop\'s branch')),
       h('div', { class: 'card card-b', style: { display: 'grid', gap: '12px' } }, rows.map((r) => h('div', {}, h('div', { class: 'orow' }, h('b', {}, r.name), h('span', { class: 'mono' }, `${r.commits} commits, ${fmtNum(r.lines)} lines added`)), h('div', { class: 'bar' }, h('i', { style: { width: Math.max(2, (r.commits / max) * 100) + '%' } }))))));
+  }
+
+  function judgeCard(p) {
+    const j = p.judge;
+    const hist = (j.history || []).length > 1 ? ' (earlier: ' + j.history.slice(0, -1).join(', ') + ')' : '';
+    return h('div', {}, h('div', { class: 'sec-h' }, h('h2', {}, 'Code judge'), h('p', {}, `${j.judges.length} independent judge${j.judges.length === 1 ? '' : 's'}, blind to who wrote what; the median per criterion counts`)),
+      h('div', { class: 'card card-b', style: { display: 'grid', gap: '12px' } },
+        h('div', { class: 'orow' }, h('b', { style: { fontSize: '22px' } }, `${j.overall} / 100  ·  grade ${j.grade}`), h('span', { class: 'faint' }, hist)),
+        ...j.criteria.map((c) => h('div', {}, h('div', { class: 'orow' }, h('span', {}, `${c.label} (${c.weight})`), h('span', { class: 'mono' }, c.score.toFixed(1) + ' / 10' + (c.scores.length > 1 ? '  [' + c.scores.map((x) => x.toFixed(1)).join(' / ') + ']' : ''))),
+          h('div', { class: 'bar' }, h('i', { style: { width: Math.max(2, c.score * 10) + '%' } })), c.cap ? h('small', { class: 'faint' }, 'Capped: ' + c.cap) : (c.note ? h('small', { class: 'faint' }, c.note) : null))),
+        j.disagreement && j.disagreement.length ? h('div', { class: 'note warn' }, h('b', {}, 'Judges disagree: '), j.disagreement.join('; ')) : null,
+        j.strengths && j.strengths.length ? h('div', {}, h('b', {}, 'Strengths'), h('ul', { class: 'muted' }, j.strengths.map((x) => h('li', {}, x)))) : null,
+        j.improvements && j.improvements.length ? h('div', {}, h('b', {}, 'What would raise the score'), h('ul', { class: 'muted' }, j.improvements.map((x) => h('li', {}, h('b', {}, x.severity + ': '), x.title + (x.detail ? ' - ' + x.detail : ''))))) : null,
+        h('small', { class: 'faint' }, 'Judges: ' + j.judges.map((x) => `${x.source} ${x.overall}`).join(', ') + '. Models have preferences; the spread above shows how much they differ.')));
+  }
+
+  function ideasCard(p) {
+    const d = p.ideation;
+    const rank = d.ranking || [];
+    const byId = Object.fromEntries(d.ideas.map((i) => [i.id, i]));
+    return h('div', {}, h('div', { class: 'sec-h' }, h('h2', {}, 'Ideas and vote'), h('p', {}, d.winner ? 'Decided by the agents themselves' : 'In progress')),
+      h('div', { class: 'card card-b', style: { display: 'grid', gap: '12px' } },
+        h('div', { class: 'prow-t' }, (d.rounds || []).map((r) => chip(`${r.n}. ${r.title}: ${r.text}`, 'ok'))),
+        ...(rank.length ? rank : d.ideas.map((i) => ({ id: i.id, title: i.title, votes: 0, score: 0 }))).map((r) => {
+          const i = byId[r.id] || {};
+          const win = d.winner === r.id;
+          return h('div', { class: win ? 'note ok' : '' }, h('div', { class: 'orow' }, h('b', {}, `${r.id}  ${r.title}${win ? '  (winner)' : ''}`), h('span', { class: 'mono' }, rank.length ? `${r.votes} vote${r.votes === 1 ? '' : 's'}, mean ${r.score}` : '')),
+            h('div', { class: 'muted', style: { fontSize: '13px' } }, i.pitch || ''), i.author && d.winner ? h('small', { class: 'faint' }, 'Proposed by ' + i.author + (i.stack ? '  ·  ' + i.stack : '')) : null,
+            win && (i.research || []).length ? h('ul', { class: 'muted', style: { fontSize: '12.5px' } }, i.research.map((x) => h('li', {}, x))) : null);
+        }),
+        (d.votes || []).length ? h('div', {}, h('b', {}, 'Ballots'), h('ul', { class: 'muted' }, d.votes.map((v) => h('li', {}, `${v.voter} voted ${v.vote}: ${v.reason || ''}`)))) : null));
   }
 
   function qualityCard(p, q) {

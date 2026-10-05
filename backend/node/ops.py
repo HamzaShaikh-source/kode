@@ -37,6 +37,35 @@ def tail(s: str, n: int = TAIL) -> str:
     return s if len(s) <= n else "..." + s[-n:]
 
 
+SKILL_DIRS = (".claude/skills", ".agents/skills", ".codex/skills", ".gemini/antigravity/skills", ".gemini/skills")
+
+
+def scan_skills(limit: int = 120) -> List[Dict[str, str]]:
+    """Skills installed on this laptop (a folder with a SKILL.md): name and one-line description, so the plan can tell each agent which ones to use."""
+    out, seen = [], set()
+    for rel in SKILL_DIRS:
+        base = Path.home() / rel
+        try:
+            dirs = sorted(x for x in base.iterdir() if x.is_dir()) if base.is_dir() else []
+        except OSError:
+            continue
+        for d in dirs:
+            f = d / "SKILL.md"
+            if d.name in seen or not f.is_file():
+                continue
+            try:
+                head = f.read_text(encoding="utf-8", errors="replace")[:1500]
+            except OSError:
+                continue
+            m = re.search(r"^description:\s*(.+)$", head, re.M)
+            desc = (m.group(1).strip().strip('"' + chr(39)) if m else "")[:140]
+            seen.add(d.name)
+            out.append({"name": d.name, "description": desc})
+            if len(out) >= limit:
+                return out
+    return out
+
+
 class Ops:
     def __init__(self, roots: List[str], env_extra: Optional[Dict[str, str]] = None):
         self.roots = [Path(r).resolve() for r in roots]
@@ -127,7 +156,8 @@ class Ops:
         who = re.search(r"account (\S+)", gh["out"])
         env = self.env_extra
         return {"git": git["code"] == 0, "gh": gh["code"] == 0, "gh_user": who.group(1) if who else "",
-                "git_name": env.get("GIT_AUTHOR_NAME") or user["out"].strip(), "git_email": env.get("GIT_AUTHOR_EMAIL") or mail["out"].strip()}
+                "git_name": env.get("GIT_AUTHOR_NAME") or user["out"].strip(), "git_email": env.get("GIT_AUTHOR_EMAIL") or mail["out"].strip(),
+                "skills": scan_skills()}
 
     async def op_repo_create(self, a):
         """github: `gh repo create <name> --private`; local: a bare repo with one initial commit on `base`."""
@@ -227,11 +257,22 @@ class Ops:
                     sized.append(((d / f).stat().st_size, f))
                 except OSError:
                     pass
-        samples = {}
+        samples, tests, loc = {}, {}, 0
+        for f in files[:600]:
+            if f.lower().endswith(code_ext) and f not in meta:
+                try:
+                    body = (d / f).read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                loc += body.count(chr(10)) + 1
+                if re.search(r"(^|/)(tests?|__tests__|spec)(/|$)|(_test|\.test|\.spec)\.", f):
+                    tests[f] = body
         for _, f in sorted(sized, reverse=True)[:6]:
             samples[f] = (d / f).read_text(encoding="utf-8", errors="replace")[:1800]
+        for f in sorted(tests, key=lambda k: -len(tests[k]))[:3]:
+            samples[f] = tests[f][:1500]
         low = readme.lower()
-        return {"samples": samples, "files": files[:400], "readme": readme[:5000], "readme_len": len(readme.strip()),
+        return {"samples": samples, "loc": loc, "test_files": len(tests), "files": files[:400], "readme": readme[:5000], "readme_len": len(readme.strip()),
                 "readme_has_run": any(k in low for k in ("run", "usage", "getting started", "install", "quick start")), "readme_has_test": "test" in low,
                 "stray": stray[:30], "secrets": secrets, "todos": todos, "big": big[:10],
                 "has_tests": any(re.search(r"(^|/)(tests?|__tests__|spec)(/|$)|(_test|\.test|\.spec)\.", f) for f in files),

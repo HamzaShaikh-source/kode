@@ -19,15 +19,12 @@ def git(*a):
     return subprocess.run(["git", *a], capture_output=True, text=True)
 
 
-def main():
-    print("Scripted demo agent ready. Waiting for instructions...", flush=True)
-    sys.stdin.readline()
+def run_task() -> None:
     task = Path(".kode/TASK.md")
     text = task.read_text(encoding="utf-8") if task.exists() else ""
     m = re.search(r"KODE-DEMO-SCRIPT:\s*(\{.*\})", text)
     if not m:
         print("No script found in .kode/TASK.md; nothing to do.", flush=True)
-        time.sleep(3600)
         return
     script = json.loads(m.group(1))
     branch = git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
@@ -48,7 +45,16 @@ def main():
     if script.get("push_after") is None or len(script.get("steps", [])) not in script.get("push_after", []):
         git("push", "-u", "origin", branch)
     print(f"KODE_DONE {n}", flush=True)
-    time.sleep(3600)
+
+
+def main():
+    """Like a real agent session it stays up and takes the next task when the lead types one (one line per task)."""
+    print("Scripted demo agent ready. Waiting for instructions...", flush=True)
+    while True:
+        if not sys.stdin.readline():
+            time.sleep(3600)
+            return
+        run_task()
 
 
 if __name__ == "__main__":
