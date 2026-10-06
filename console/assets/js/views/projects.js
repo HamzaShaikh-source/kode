@@ -205,7 +205,7 @@ export function mount(root, arg) {
       k === 'build' && working ? h('span', { class: 'n hot' }, String(working)) : k === 'context' && (p.context || []).length ? h('span', { class: 'n' }, String(p.context.length)) : k === 'log' ? h('span', { class: 'n' }, String((p.log || []).length)) : null))));
     const body = h('div', { role: 'tabpanel' });
     if (tab === 'overview') {
-      const parts = [P.stepsCard(p), p.status === 'plan_ready' ? planReview(p) : null, ['planning', 'questions'].includes(p.status) ? P.ideasCard(p) : null];
+      const parts = [P.stepsCard(p), P.plannerCard(p), p.status === 'plan_ready' ? planReview(p) : null, ['planning', 'questions'].includes(p.status) ? P.ideasCard(p) : null];
       if (['running', 'paused', 'review', 'done'].includes(p.status) && (p.tasks || []).length) {
         const act_ = p.tasks.filter((t) => ['running', 'starting', 'review'].includes(t.status));
         parts.push(h('div', {}, h('div', { class: 'sec-h' }, h('h2', {}, act_.length ? 'Being worked on right now' : 'Progress'), h('p', {}, `${p.tasks.filter((t) => t.status === 'merged').length} of ${p.tasks.length} tasks merged`)),

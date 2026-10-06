@@ -237,3 +237,64 @@ def test_limits_come_from_codex_rollouts_and_claude_session_logs(tmp_path, monke
     assert out["codex"]["primary"]["used_percent"] == 41.0 and out["codex"]["secondary"]["window_minutes"] == 10080 and out["codex"]["plan"] == "plus"
     assert out["claude"]["last_5h"]["out"] == 200 and out["claude"]["last_7d"]["out"] == 250 and out["claude"]["messages_5h"] == 1
     assert "agy" in out and "does not expose" in out["agy"]["note"]
+
+
+# ───────── menus, swallowed prompts, planner visibility ─────────
+def test_agent_menus_are_not_mistaken_for_work():
+    assert hp.NAVDLG.search("Select model\n↑/↓ Navigate · enter Confirm")
+    assert hp.DISMISS.search("┃ Gemini 3.6 & 3.7 Flash Deprecation\n┃ esc to dismiss")
+    assert not hp.NAVDLG.search("Working (14s • esc to interrupt)")
+
+
+def test_an_agent_that_swallowed_its_first_prompt_gets_it_again(monkeypatch):
+    e = engine()
+    p = proj()
+    t = task(sid="s1", mark0=0)
+    s = Sess("┃ esc to dismiss\n> ")
+    e.hub.sessions["s1"] = s
+    keys, typed = [], []
+
+    async def lead_input(actor, sess, text, label=""):
+        keys.append(text)
+
+    async def ensure_copilot(sess):
+        pass
+
+    async def type_line(sess, text):
+        typed.append(text)
+    e.hub.lead_input, e.hub.ensure_copilot, e.type_line = lead_input, ensure_copilot, type_line
+    e.hub.orch = type("O", (), {"actor": "orchestrator"})()
+    real = asyncio.sleep
+
+    async def fast(x, *a):
+        await real(0)
+    monkeypatch.setattr(hp.asyncio, "sleep", fast)
+    run(e.ensure_started(p, t, s, "Read .kode/TASK.md and do the task"))
+    assert keys and keys[0] == hp.KEYMAP["esc"] and typed[0] == "Read .kode/TASK.md and do the task" and len(typed) <= 2
+    assert any("had not started" in l["text"] for l in p["log"])
+
+
+def test_the_console_is_told_which_model_works_on_which_prompt():
+    e = engine()
+    e.hub.nodes = {"n1": FakeNode(["claude"])}
+    e.hub.nodes["n1"].member_name = "Asha"
+    p = proj()
+    seen = []
+
+    class Inner:
+        provider, node_id = "claude", "n1"
+
+        async def complete(self, system, user, *, max_tokens=0):
+            seen.append([c["title"] for c in p["live_calls"]])                # visible while the model is thinking
+            return LLMResult("answer", 5, 5, "stop")
+    run(e.metered(p, Inner(), "plan").complete("sys", "user text"))
+    assert seen == [["Writing the plan and the contract"]] and p["live_calls"] == []
+    c = p["planner_calls"][-1]
+    assert c["ok"] and c["who"] == "Claude Code on Asha" and c["in_chars"] == 12 and c["out_chars"] == 6
+
+    class Bad(Inner):
+        async def complete(self, system, user, *, max_tokens=0):
+            raise RuntimeError("boom")
+    with pytest.raises(RuntimeError):
+        run(e.metered(p, Bad(), "triage").complete("a", "b"))
+    assert p["planner_calls"][-1]["ok"] is False and "boom" in p["planner_calls"][-1]["err"] and p["live_calls"] == []

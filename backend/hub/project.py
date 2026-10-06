@@ -61,6 +61,11 @@ CONSENT = re.compile(r"Terms\s*of\s*Service|Privacy\s*Policy|I\s*agree|I\s*accep
 # Tool-permission questions from the agent ("Do you want to proceed? 1. Yes ..."): the first option is the affirmative one in every supported TUI.
 PERMISSION = re.compile(r"Do\s*you\s*want\s*to\s*(proceed|allow|make\s*this\s*edit|create|run)|Allow\s*(once|this|command|creation|edit|write|the)|Yes,\s*allow|Yes,\s*and\s*don.t\s*ask\s*again|\(y/n\)|Approve\s*(this|the)|Run\s*this\s*command\?", re.I)
 # An agent offering to update itself must be told to SKIP: its default option is usually "Update now", which would install software on the teammate's machine.
+NAVDLG = re.compile(r"(\u2191/\u2193|up/down)\s*navigate.{0,24}enter\s*confirm|select\s*(a|your)\s*model|choose\s*a\s*model", re.I)
+DISMISS = re.compile(r"esc to dismiss", re.I)
+PURPOSE_TITLE = {"plan": "Writing the plan and the contract", "questions": "Preparing questions for you", "triage": "Diagnosing why verification failed", "review": "Reviewing code quality and the README",
+                 "judge": "Scoring the project (one judge)", "decisions": "Deciding what to do about a stuck task", "supervisor": "Reading an agent's screen to answer its prompt", "rework": "Turning your feedback into tasks",
+                 "submission": "Writing the submission text", "ideas": "Hackathon ideas round"}
 UPDATE = re.compile(r"Update\s*available|Update\s*now|new\s*version\s*(is\s*)?available|upgrade\s*to", re.I)
 # Review screens that wait for a human decision on a file change (Antigravity's diff viewer). Keys typed into them are interpreted as commands, so never nudge into one.
 DIFFVIEW = re.compile(r"next/prev\s*diff|cycle\s*file|delete\s*comment", re.I)
@@ -352,16 +357,30 @@ class CliClient:
         return LLMResult(r["text"], 0, 0, "stop")
 
 
+def providerName(pid: str) -> str:
+    return {"claude": "Claude Code", "codex": "Codex", "agy": "Antigravity", "commandcode": "Command Code", "opencode": "OpenCode", "hermes": "Hermes"}.get(pid or "", pid or "the model")
+
+
 class Metered:
     """Wraps a model client and records what every call costs (estimated from text length when the provider reports no tokens)."""
 
-    def __init__(self, inner, ledger, purpose: str):
-        self.inner, self.ledger, self.purpose = inner, ledger, purpose
+    def __init__(self, inner, ledger, purpose: str, live=None):
+        self.inner, self.ledger, self.purpose, self.live = inner, ledger, purpose, live
 
     async def complete(self, system: str, user: str, *, max_tokens: int = 0):
         t0 = time.time()
-        res = await self.inner.complete(system, user, max_tokens=max_tokens)
+        cid = secrets.token_hex(3)
+        if self.live:
+            self.live("start", cid, self.purpose, self.inner, system, user, t0, None, "")
+        try:
+            res = await self.inner.complete(system, user, max_tokens=max_tokens)
+        except Exception as e:
+            if self.live:
+                self.live("fail", cid, self.purpose, self.inner, system, user, t0, None, f"{type(e).__name__}: {str(e)[:160]}")
+            raise
         self.ledger(self.purpose, res, system, user, time.time() - t0)
+        if self.live:
+            self.live("end", cid, self.purpose, self.inner, system, user, t0, res, "")
         return res
 
 
@@ -547,7 +566,24 @@ class ProjectEngine:
         u["secs"] = round(u["secs"] + secs, 1)
 
     def metered(self, p: dict, client, purpose: str):
-        return Metered(client, lambda *a: self.ledger(p, *a), purpose)
+        return Metered(client, lambda *a: self.ledger(p, *a), purpose, live=lambda *a: self.live_call(p, *a))
+
+    def live_call(self, p: dict, ev: str, cid: str, purpose: str, inner, system: str, user: str, t0: float, res, err: str) -> None:
+        """What the Brain's model is doing right now (and the last few calls), so the console never shows a bare 'working'."""
+        prov = getattr(inner, "provider", None)
+        nid = getattr(inner, "node_id", "")
+        who = f"{providerName(prov)} on {self.node_name(nid)}" if prov else ("an API model" if getattr(inner, "p", None) or hasattr(inner, "inner") else "the model")
+        live = p.setdefault("live_calls", [])
+        cur = next((c for c in live if c["id"] == cid), None)
+        if ev == "start":
+            live.append({"id": cid, "purpose": purpose, "title": PURPOSE_TITLE.get(purpose, purpose), "who": who, "since": t0, "in_chars": len(system) + len(user)})
+        else:
+            p["live_calls"] = [c for c in live if c["id"] != cid]
+            calls = p.setdefault("planner_calls", [])
+            calls.append({"purpose": purpose, "title": PURPOSE_TITLE.get(purpose, purpose), "who": who, "at": time.time(), "took": round(time.time() - t0, 1), "in_chars": len(system) + len(user),
+                          "out_chars": len(res.text) if res else 0, "ok": ev == "end", "err": err})
+            del calls[:-16]
+        self.save(p)
 
     def now(self, p: dict, text: str, sub: str = "") -> None:
         """One plain sentence for the console: what the Brain is doing right now (the console adds a ticking timer)."""
@@ -1560,9 +1596,29 @@ wait = it is probably just slow. ask_human = only if nothing above can help."""
         else:
             await self.type_line(s, first)
         asyncio.create_task(self.ensure_submitted(s, "Read .kode/TASK.md" if reuse is None else f"Next task for you: {t['id']}"))
+        asyncio.create_task(self.ensure_started(p, t, s, first))
         t["status"], t["started"], t["last_progress"] = "running", time.time(), time.time()
         t["last_head"], t["settled"] = "", 0
         self.save(p)
+
+    async def ensure_started(self, p: dict, t: dict, s, text: str) -> None:
+        """Some agents (Antigravity with a notice banner or a model menu open) swallow the first prompt and sit at an empty input. If, half a minute later, the agent
+        has printed almost nothing since the task began, clear what is in the way and send the prompt once more."""
+        for _ in range(2):
+            await asyncio.sleep(30)
+            if s.state != "live" or t.get("status") not in ("running", "starting") or t.get("sid") != s.sid:
+                return
+            if self.agent_busy(s) or len(self.fresh(s, t.get("mark0", 0), 3000)) > 900:
+                return                                                       # it is doing something
+            await self.hub.ensure_copilot(s)
+            scr = self.screen(s, 700)
+            if DISMISS.search(scr):
+                await self.hub.lead_input(self.hub.orch.actor, s, KEYMAP["esc"], label="project")
+                await asyncio.sleep(1.0)
+            elif NAVDLG.search(scr):
+                return                                                       # a menu is open: the supervisor answers it
+            if await self.send_prompt(s, text, text[:30], wait=5):
+                self.log(p, "nudge", f"{t['id']}: the agent had not started ({s.label} showed an empty prompt); sent the task prompt again", t["id"])
 
     async def settle_prompts(self, p: dict, t: dict, s) -> None:
         """First-run dialogs (trust this folder? pick a theme?) are answered before the task prompt is typed, so it is not typed into a menu.
@@ -1668,7 +1724,11 @@ wait = it is probably just slow. ask_human = only if nothing above can help."""
         dead = (not s) or s.state in ("exited", "error", "offline")
         if s and not dead:
             fr = self.fresh(s, t.get("prompt_mark", 0), 1200)
-            hit = bool(STARTUP.search(fr) or PERMISSION.search(fr) or CONSENT.search(fr)) or (s.needs_input() and bool(fr))
+            hit = bool(STARTUP.search(fr) or PERMISSION.search(fr) or CONSENT.search(fr) or NAVDLG.search(self.screen(s, 700))) or (s.needs_input() and bool(fr))
+            if DISMISS.search(self.screen(s, 600)) and time.time() - t.get("dismiss_at", 0) > 90 and not self.agent_busy(s):
+                t["dismiss_at"] = time.time()
+                await self.hub.ensure_copilot(s)
+                await self.hub.lead_input(self.hub.orch.actor, s, KEYMAP["esc"], label="project")     # a notice banner can swallow the next thing typed
             # Some TUIs keep blinking a dot while a dialog waits, so "no output" is the wrong test: the dialog is real once the same
             # question text has been on screen (ignoring the blinking glyphs) for a few seconds.
             sig = re.sub(r"[●○◐-◓·•⠋-⣿\s]+", "", fr)[-200:] if hit else ""
@@ -1692,10 +1752,11 @@ wait = it is probably just slow. ask_human = only if nothing above can help."""
             t["last_head"], t["last_progress"] = gs["head"], time.time()
         idle = time.time() - s.last_out if s and not dead else 999
         marker = bool(s and DONE_MARK.search(self.fresh(s, t.get("mark0", 0), 2500)))
-        busy = bool(s and not dead and self.agent_busy(s))
+        dlg = bool(s and not dead and NAVDLG.search(self.screen(s, 700)))
+        busy = bool(s and not dead and not dlg and self.agent_busy(s))
         limit = bool(s and not dead and not busy and not marker and idle >= 20 and LIMIT_RX.search(self.fresh(s, t.get("mark0", 0), 700)))
         apierr = bool(s and not dead and not busy and not marker and idle >= 90 and API_ERR.search(self.screen(s, 500)))
-        state = "ended" if dead else "limit" if limit else "api_error" if apierr else "working" if (busy or idle < 20) else "idle"
+        state = "ended" if dead else "limit" if limit else "api_error" if apierr else "menu" if dlg else "working" if (busy or idle < 20) else "idle"
         t["activity"] = {"state": state, "idle": int(idle) if idle < 999 else 0, "line": self.last_line(s) if (s and not dead) else "", "ts": int(time.time()), "agent": t.get("agent") or m["provider"]}
         if limit or apierr:
             if await self.failover(p, t, m, "hit its usage or rate limit" if limit else "keeps failing with API errors"):

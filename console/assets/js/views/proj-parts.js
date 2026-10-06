@@ -63,11 +63,24 @@ export function nowInfo(p) {
   return { tone: 'live', spin: true, title: (p.now && p.now.text) || 'Working', sub: (p.now && p.now.sub) || '', then: nxt, since };
 }
 
+export function liveCalls(p) {
+  return (p.live_calls || []).map((c) => h('div', { class: 'now-s live-call' }, h('span', { class: 'pulse' }, '● '), h('b', {}, c.who), ' is ', c.title.charAt(0).toLowerCase() + c.title.slice(1), ' · ', timer(c.since), ` · prompt ${fmtNum(c.in_chars)} characters, waiting for the reply`));
+}
+
+export function plannerCard(p) {
+  const live = p.live_calls || [], done = (p.planner_calls || []).slice().reverse().slice(0, 8);
+  if (!live.length && !done.length) return null;
+  return h('section', { class: 'card' }, h('div', { class: 'card-h' }, icon('brain', 17), h('h3', {}, 'What the planner is doing'), h('span', { class: 'faint', style: { marginLeft: 'auto' } }, 'Every question the Brain asks a model')),
+    h('div', { class: 'card-b' }, h('table', { class: 'rtab' }, h('thead', {}, h('tr', {}, ['', 'For', 'Model', 'Prompt', 'Reply', 'Time'].map((x) => h('th', {}, x)))),
+      h('tbody', {}, live.map((c) => h('tr', {}, h('td', {}, h('span', { class: 'pulse' }, '●')), h('td', {}, c.title), h('td', {}, c.who), h('td', { class: 'mono' }, fmtNum(c.in_chars)), h('td', { class: 'faint' }, 'waiting…'), h('td', { class: 'mono' }, timer(c.since)))),
+        done.map((c) => h('tr', {}, h('td', {}, c.ok ? '✓' : '!'), h('td', {}, c.title), h('td', {}, c.who), h('td', { class: 'mono' }, fmtNum(c.in_chars)), h('td', { class: 'mono' }, c.ok ? fmtNum(c.out_chars) : (c.err || 'failed')), h('td', { class: 'mono' }, dur(c.took))))))));
+}
+
 export function nowBanner(p) {
   const n = nowInfo(p);
   const orb = n.tone === 'good' ? icon('check', 20) : n.tone === 'bad' ? icon('alert', 20) : n.tone === 'wait' ? icon('hand', 20) : n.spin ? icon('bolt', 20, 'spin') : icon('clock', 20);
   return h('section', { class: 'now ' + (n.tone || ''), 'aria-live': 'polite' }, h('div', { class: 'now-orb' }, orb),
-    h('div', {}, h('div', { class: 'now-t' }, n.title), n.sub ? h('div', { class: 'now-s' }, n.sub) : null, n.then ? h('div', { class: 'now-s faint' }, n.then) : null),
+    h('div', {}, h('div', { class: 'now-t' }, n.title), n.sub ? h('div', { class: 'now-s' }, n.sub) : null, ...liveCalls(p), n.then ? h('div', { class: 'now-s faint' }, n.then) : null),
     n.since ? h('div', { class: 'now-timer' }, timer(n.since, n.until), h('small', {}, n.tone === 'good' ? 'total' : 'in this step')) : null);
 }
 
@@ -162,6 +175,7 @@ const stateOf = (p, t) => {
   if (a.state === 'limit') return ['limit', 'Hit a usage limit: switching agent'];
   if (a.state === 'api_error') return ['api_error', 'API errors: switching agent'];
   if (a.state === 'ended') return ['ended', 'Agent session ended: restarting'];
+  if (a.state === 'menu') return ['idle', 'A menu is open: the supervisor is answering it'];
   if (a.state === 'idle') return ['idle', `Idle for ${dur(a.idle)}`];
   return ['working', 'Working'];
 };
