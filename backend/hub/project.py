@@ -343,7 +343,7 @@ class CliClient:
     async def complete(self, system: str, user: str, *, max_tokens: int = 0):
         from llm import LLMResult
         prompt = system + chr(10) * 2 + user + chr(10) * 2 + "Reply with the JSON object only, no commentary and no code fences."
-        sid = str(__import__("uuid").uuid5(__import__("uuid").NAMESPACE_URL, "kode-planner-" + self.session)) if self.session else ""
+        sid = self.engine.psid.get(self.session) or (str(__import__("uuid").uuid5(__import__("uuid").NAMESPACE_URL, "kode-planner-" + self.session)) if self.session else "")
         again = bool(sid) and self.engine.psess.get(self.session, False)
         r = await self.engine.hub.node_op(self.node_id, "cli_complete", 900.0, tool=self.provider, cmd_timeout=840, prompt=prompt,
                                           **({"session_id": sid, "resume": again} if sid else {}))
@@ -351,9 +351,11 @@ class CliClient:
         if not r.get("ok") and sid and not again and "already in use" in err:                  # after a Brain restart the conversation exists: continue it instead of creating it again
             r = await self.engine.hub.node_op(self.node_id, "cli_complete", 900.0, tool=self.provider, cmd_timeout=840, prompt=prompt, session_id=sid, resume=True)
             err = str(r.get("err", "")).lower()
-        if not r.get("ok") and sid and ("session" in err or "conversation" in err):
-            r = await self.engine.hub.node_op(self.node_id, "cli_complete", 900.0, tool=self.provider, cmd_timeout=840, prompt=prompt,
-                                              session_id=str(__import__("uuid").uuid4()), resume=False)             # the saved conversation is gone: start a new one
+        if not r.get("ok") and sid and "did not answer" not in err:                         # any failure of the saved conversation (gone, other folder, in use): start a new one
+            sid = str(__import__("uuid").uuid4())
+            r = await self.engine.hub.node_op(self.node_id, "cli_complete", 900.0, tool=self.provider, cmd_timeout=840, prompt=prompt, session_id=sid, resume=False)
+            if r.get("ok"):
+                self.engine.psid[self.session] = sid                                                              # later calls continue this new conversation
         if not r.get("ok"):
             raise RuntimeError(f"planner ({self.provider} CLI): {r.get('err', 'failed')}")
         if sid:
@@ -399,6 +401,7 @@ class ProjectEngine:
         self.sup_calls: Dict[str, int] = {}
         self.sup_down: Dict[str, float] = {}
         self.pending_ctx: Dict[str, list] = {}                # context items sent with project_create, ingested when planning starts (never stored raw)
+        self.psid: Dict[str, str] = {}                        # project id -> the planner conversation id that actually works
         self.psess: Dict[str, bool] = {}                      # project id -> the planner's Claude session already exists
 
     # ───────────── persistence / state out ─────────────

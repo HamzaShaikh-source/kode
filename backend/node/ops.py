@@ -610,7 +610,7 @@ class Ops:
             raise OpError(f"{tool} did not answer within {float(a.get('cmd_timeout', 600)):.0f}s")
         text = out.decode("utf-8", "replace").strip()
         if proc.returncode != 0 or not text:
-            raise OpError(f"{tool} failed (exit {proc.returncode}): {tail(err.decode('utf-8', 'replace'), 300).strip()}")
+            raise OpError(f"{tool} failed (exit {proc.returncode}): {tail((err.decode('utf-8', 'replace').strip() or text), 300).strip()}")
         return {"text": text}
 
     async def op_read_file(self, a):
