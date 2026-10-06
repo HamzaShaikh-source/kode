@@ -149,7 +149,8 @@ def load_manifests(directory: Path = MANIFEST_DIR) -> Dict[str, Manifest]:
             raise ValueError(f"bad manifest {f.name}: needs id, label and a non-empty command list")
         sub = {"{python}": sys.executable, "{backend}": str(Path(__file__).resolve().parents[1])}
         cmd = []
-        for c in (d.get("command_win") if sys.platform == "win32" and d.get("command_win") else d["command"]):
+        use_win = sys.platform == "win32" and d.get("command_win") and shutil.which(str(d["command_win"][0]))       # the preferred shim, but only if it exists (an interrupted npm update can remove it)
+        for c in (d["command_win"] if use_win else d["command"]):
             c = str(c)
             for k, v in sub.items():
                 c = c.replace(k, v)
