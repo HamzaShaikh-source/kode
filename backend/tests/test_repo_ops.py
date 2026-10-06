@@ -139,3 +139,12 @@ def test_access_automation_names_who_still_cannot_push():
             hp.asyncio.sleep = real
     with pytest.raises(RuntimeError, match=r"Asha \(@asha\)"):
         run(go())
+
+
+def test_repo_description_never_contains_control_characters(tmp_path):
+    o = FakeGh(tmp_path, {"api user": {"code": 0, "out": "naman\n"}})
+    r = run(o.run("repo_create", {"forge": "github", "repo_name": "flappy", "base": "main", "description": "Flappy bird\n\nwith\ttabs and a \x07 bell"}))
+    assert r["ok"]
+    create = next(c for c in o.calls if c[:3] == ["gh", "repo", "create"])
+    d = create[create.index("--description") + 1]
+    assert d == "Flappy bird with tabs and a bell" and not any(ord(ch) < 32 for ch in d)

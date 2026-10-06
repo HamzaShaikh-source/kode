@@ -154,6 +154,12 @@ def scan_limits() -> Dict[str, Any]:
     return out
 
 
+def clean_desc(v) -> str:
+    """GitHub rejects control characters in a repository description: collapse every run of whitespace/control characters to one space."""
+    t = "".join(" " if (ord(ch) < 32 or ord(ch) == 127) else ch for ch in str(v or ""))
+    return " ".join(t.split())[:300] or "K.O.D.E. project"
+
+
 class Ops:
     def __init__(self, roots: List[str], env_extra: Optional[Dict[str, str]] = None):
         self.roots = [Path(r).resolve() for r in roots]
@@ -266,7 +272,7 @@ class Ops:
         if not re.fullmatch(r"([A-Za-z0-9][A-Za-z0-9-]{0,38}/)?[A-Za-z0-9._-]{1,100}", name):
             raise OpError("repository name may only contain letters, numbers, '.', '-' and '_' (optionally owner/name)")
         vis = "--public" if a.get("visibility") == "public" else "--private"
-        r = await self.sh(["gh", "repo", "create", name, vis, "--add-readme", "--description", a.get("description", "K.O.D.E. project")[:300]], self.roots[0], 90)
+        r = await self.sh(["gh", "repo", "create", name, vis, "--add-readme", "--description", clean_desc(a.get("description"))], self.roots[0], 90)
         if r["code"] != 0:
             raise OpError("gh repo create failed: " + tail(r["out"], 600).strip())
         if "/" in name:
