@@ -90,7 +90,7 @@ def project_args(provider: str, auto: bool, turbo: bool = False, resume: bool = 
     if provider == "commandcode":
         return ["--skip-onboarding", "--no-auto-update", "--trust"] + (["--yolo"] if turbo else ["--accept-edits"]) + (["-c"] if resume else [])
     if provider == "codex" and (auto or turbo):         # Codex's Windows sandbox cannot start commands, and workspace-write blocks `git push` (no network)
-        return ["-s", "danger-full-access", "-a", "never"]
+        return ["-c", "check_for_update_on_startup=false", "-s", "danger-full-access", "-a", "never"]      # an update prompt must never start `npm install -g` in the middle of a task
     return []
 
 

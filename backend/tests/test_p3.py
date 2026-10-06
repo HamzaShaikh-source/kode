@@ -317,3 +317,9 @@ def test_planner_conversation_survives_a_brain_restart():
     r = run(c.complete("sys", "user"))
     assert r.text == "{}" and calls[0]["resume"] is False and calls[1]["resume"] is True and calls[1]["session_id"] == calls[0]["session_id"]
     assert e.psess["p1"] is True                                                           # later calls resume straight away
+
+
+def test_codex_never_updates_itself_in_the_middle_of_a_task():
+    from hub import apiprofiles
+    args = apiprofiles.project_args("codex", True, True)
+    assert "check_for_update_on_startup=false" in args and apiprofiles.validate_launch({}, args) is None
