@@ -347,7 +347,11 @@ class CliClient:
         again = bool(sid) and self.engine.psess.get(self.session, False)
         r = await self.engine.hub.node_op(self.node_id, "cli_complete", 900.0, tool=self.provider, cmd_timeout=840, prompt=prompt,
                                           **({"session_id": sid, "resume": again} if sid else {}))
-        if not r.get("ok") and sid and again and ("session" in str(r.get("err", "")).lower() or "conversation" in str(r.get("err", "")).lower()):
+        err = str(r.get("err", "")).lower()
+        if not r.get("ok") and sid and not again and "already in use" in err:                  # after a Brain restart the conversation exists: continue it instead of creating it again
+            r = await self.engine.hub.node_op(self.node_id, "cli_complete", 900.0, tool=self.provider, cmd_timeout=840, prompt=prompt, session_id=sid, resume=True)
+            err = str(r.get("err", "")).lower()
+        if not r.get("ok") and sid and ("session" in err or "conversation" in err):
             r = await self.engine.hub.node_op(self.node_id, "cli_complete", 900.0, tool=self.provider, cmd_timeout=840, prompt=prompt,
                                               session_id=str(__import__("uuid").uuid4()), resume=False)             # the saved conversation is gone: start a new one
         if not r.get("ok"):

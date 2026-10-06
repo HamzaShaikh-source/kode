@@ -298,3 +298,22 @@ def test_the_console_is_told_which_model_works_on_which_prompt():
     with pytest.raises(RuntimeError):
         run(e.metered(p, Bad(), "triage").complete("a", "b"))
     assert p["planner_calls"][-1]["ok"] is False and "boom" in p["planner_calls"][-1]["err"] and p["live_calls"] == []
+
+
+def test_planner_conversation_survives_a_brain_restart():
+    from hub.project import CliClient
+    e = engine()
+    calls = []
+
+    async def node_op(nid, name, timeout=0, **a):
+        calls.append(a)
+        if not a.get("resume") and len([c for c in calls if not c.get("resume")]) >= 1 and len(calls) > 1 and a.get("session_id") == calls[0]["session_id"]:
+            return {"ok": False, "err": "claude failed (exit 1): Error: Session ID x is already in use."}
+        if len(calls) == 1:
+            return {"ok": False, "err": "claude failed (exit 1): Error: Session ID x is already in use."}
+        return {"ok": True, "text": "{}"}
+    e.hub.node_op = node_op
+    c = CliClient(e, "claude", "n1", session="p1")
+    r = run(c.complete("sys", "user"))
+    assert r.text == "{}" and calls[0]["resume"] is False and calls[1]["resume"] is True and calls[1]["session_id"] == calls[0]["session_id"]
+    assert e.psess["p1"] is True                                                           # later calls resume straight away
